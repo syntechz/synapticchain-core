@@ -1,0 +1,428 @@
+// SynapticChain DEX - OrderBook Contract
+// On-chain limit order matching
+
+#[state]
+contract OrderBook {
+    #[persistent]
+    let factory: Address;
+
+    // Order structure
+    struct Order {
+        id: u256,
+        trader: Address,
+        token_in: Address,
+        token_out: Address,
+        amount: u256,
+        price: u256,        // Price in token_out per token_in * 1e18
+        is_buy: bool,
+        filled: u256,
+        status: u8,         // 0=OPEN, 1=FILLED, 2=CANCELLED
+        timestamp: u64,
+    }
+
+    #[persistent]
+    let next_order_id: u256 = 1;
+
+    #[persistent]
+    map orders: Map<u256, Order>;
+
+    // Price level: price => list of order IDs
+    #[persistent]
+    map buy_levels: Map<u256, Vec<u256>>;   // Sorted descending
+
+    #[persistent]
+    map sell_levels: Map<u256, Vec<u256>>;  // Sorted ascending
+
+    // Trader's open orders
+    #[persistent]
+    map trader_orders: Map<Address, Vec<u256>>;
+
+    // Locked balances
+    #[persistent]
+    map locked_balance: Map<(Address, Address), u256>;
+
+    // Active price levels (for iteration without Map.iter)
+    #[persistent]
+    let buy_price_list: Vec<u256>;
+    #[persistent]
+    let sell_price_list: Vec<u256>;
+
+    // Events
+    event OrderPlaced {
+        id: u256,
+        trader: Address,
+        token_in: Address,
+        token_out: Address,
+        amount: u256,
+        price: u256,
+        is_buy: bool,
+    }
+
+    event OrderFilled {
+        id: u256,
+        filled_amount: u256,
+        remaining: u256,
+    }
+
+    event OrderCancelled {
+        id: u256,
+    }
+
+    #[init]
+    fn new(factory_addr: Address) {
+        self.factory = factory_addr;
+    }
+
+    // Place a limit order
+    #[payable]
+    fn place_order(
+        token_in: Address,
+        token_out: Address,
+        amount: u256,
+        price: u256,
+        is_buy: bool
+    ) -> u256 {
+        verify amount > 0, "ZERO_AMOUNT";
+        verify price > 0, "ZERO_PRICE";
+        verify token_in != token_out, "IDENTICAL_TOKENS";
+
+        let order_id = self.next_order_id;
+        self.next_order_id += 1;
+
+        // Lock tokens for sell orders
+        if !is_buy {
+            // Sell order: lock token_in (the token being sold)
+            let current_locked = self.locked_balance.get((msg.sender, token_in)).unwrap_or(0);
+            let balance = Token::balance_of(token_in, msg.sender);
+            verify balance >= current_locked + amount, "INSUFFICIENT_BALANCE";
+            self.locked_balance.insert((msg.sender, token_in), current_locked + amount);
+        } else {
+            // Buy order: lock token_in (payment currency)
+            let required = (amount * price) / 1_000_000_000_000_000_000;  // Scale by 1e18
+            let current_locked = self.locked_balance.get((msg.sender, token_in)).unwrap_or(0);
+            let balance = Token::balance_of(token_in, msg.sender);
+            verify balance >= current_locked + required, "INSUFFICIENT_BALANCE";
+            self.locked_balance.insert((msg.sender, token_in), current_locked + required);
+        }
+
+        let order = Order {
+            id: order_id,
+            trader: msg.sender,
+            token_in,
+            token_out,
+            amount,
+            price,
+            is_buy,
+            filled: 0,
+            status: 0,
+            timestamp: block::timestamp(),
+        };
+
+        self.orders.insert(order_id, order);
+
+        // Add to price levels
+        if is_buy {
+            let mut level = self.buy_levels.get(price).unwrap_or(Vec::new());
+            level.push(order_id);
+            self.buy_levels.insert(price, level);
+            // Track price in list
+            if !self.price_in_list(self.buy_price_list, price) {
+                self.buy_price_list.push(price);
+                self.sort_descending(self.buy_price_list);
+            }
+        } else {
+            let mut level = self.sell_levels.get(price).unwrap_or(Vec::new());
+            level.push(order_id);
+            self.sell_levels.insert(price, level);
+            // Track price in list
+            if !self.price_in_list(self.sell_price_list, price) {
+                self.sell_price_list.push(price);
+                self.sort_ascending(self.sell_price_list);
+            }
+        }
+
+        // Track trader's orders
+        let mut trader_list = self.trader_orders.get(msg.sender).unwrap_or(Vec::new());
+        trader_list.push(order_id);
+        self.trader_orders.insert(msg.sender, trader_list);
+
+        // Try to match immediately (cap at 5 fills per call for gas safety)
+        self.match_order(order_id, 5);
+
+        emit OrderPlaced {
+            id: order_id,
+            trader: msg.sender,
+            token_in,
+            token_out,
+            amount,
+            price,
+            is_buy,
+        };
+
+        return order_id;
+    }
+
+    // Cancel an order
+    fn cancel_order(order_id: u256) {
+        let order = self.orders.get(order_id).unwrap();
+        verify order.trader == msg.sender, "UNAUTHORIZED";
+        verify order.status == 0, "NOT_OPEN";
+
+        // Unlock tokens
+        let remaining = order.amount - order.filled;
+        if !order.is_buy {
+            let locked = self.locked_balance.get((order.trader, order.token_in)).unwrap_or(0);
+            self.locked_balance.insert((order.trader, order.token_in), locked - remaining);
+        } else {
+            let required = (remaining * order.price) / 1_000_000_000_000_000_000;
+            let locked = self.locked_balance.get((order.trader, order.token_in)).unwrap_or(0);
+            self.locked_balance.insert((order.trader, order.token_in), locked - required);
+        }
+
+        order.status = 2;
+        self.orders.insert(order_id, order);
+
+        emit OrderCancelled { id: order_id };
+    }
+
+    // Match an order against the book (with max_iterations cap)
+    fn match_order(order_id: u256, max_iterations: u64) {
+        let order = self.orders.get(order_id).unwrap();
+        if order.status != 0 {
+            return;
+        }
+
+        let mut remaining = order.amount - order.filled;
+        let mut iterations: u64 = 0;
+
+        // Get price list based on order type
+        let prices = if order.is_buy {
+            self.sell_price_list
+        } else {
+            self.buy_price_list
+        };
+
+        let price_len = prices.len();
+        let mut p_idx = 0;
+        while p_idx < price_len && remaining > 0 && iterations < max_iterations {
+            let price = prices[p_idx];
+
+            // Check price compatibility
+            if order.is_buy && price > order.price {
+                break;
+            }
+            if !order.is_buy && price < order.price {
+                break;
+            }
+
+            let level = if order.is_buy {
+                self.sell_levels.get(price).unwrap_or(Vec::new())
+            } else {
+                self.buy_levels.get(price).unwrap_or(Vec::new())
+            };
+
+            let level_len = level.len();
+            let mut o_idx = 0;
+            while o_idx < level_len && remaining > 0 && iterations < max_iterations {
+                let existing_id = level[o_idx];
+                let existing = self.orders.get(existing_id).unwrap();
+                if existing.status != 0 || existing.trader == order.trader {
+                    o_idx += 1;
+                    continue;
+                }
+
+                let fill_amount = math::min(remaining, existing.amount - existing.filled);
+
+                // Execute the fill with actual token settlement
+                self.execute_fill(order_id, existing_id, fill_amount);
+                iterations += 1;
+
+                remaining -= fill_amount;
+                o_idx += 1;
+            }
+
+            p_idx += 1;
+        }
+    }
+
+    // Execute a fill between two orders — ACTUAL TOKEN SETTLEMENT
+    fn execute_fill(order_id: u256, existing_id: u256, amount: u256) {
+        let mut order = self.orders.get(order_id).unwrap();
+        let mut existing = self.orders.get(existing_id).unwrap();
+
+        // Determine buy/sell roles
+        let buy_order = if order.is_buy { order } else { existing };
+        let sell_order = if order.is_buy { existing } else { order };
+
+        // Calculate settlement amounts
+        // sell_order sells token_out, receives token_in (payment)
+        // buy_order buys token_out, pays token_in
+        let token_out_amount = amount;
+        let token_in_amount = (amount * buy_order.price) / 1_000_000_000_000_000_000;
+
+        // Transfer token_out from seller to buyer
+        Token::transfer_from(sell_order.token_out, sell_order.trader, buy_order.trader, token_out_amount);
+
+        // Transfer token_in (payment) from buyer to seller
+        Token::transfer_from(buy_order.token_in, buy_order.trader, sell_order.trader, token_in_amount);
+
+        // Update order states
+        order.filled += amount;
+        existing.filled += amount;
+
+        // Update locked balances
+        // Seller: unlock remaining token_out
+        let sell_locked = self.locked_balance.get((sell_order.trader, sell_order.token_in)).unwrap_or(0);
+        if sell_locked >= token_out_amount {
+            self.locked_balance.insert((sell_order.trader, sell_order.token_in), sell_locked - token_out_amount);
+        }
+
+        // Buyer: unlock remaining token_in payment
+        let buy_locked = self.locked_balance.get((buy_order.trader, buy_order.token_in)).unwrap_or(0);
+        if buy_locked >= token_in_amount {
+            self.locked_balance.insert((buy_order.trader, buy_order.token_in), buy_locked - token_in_amount);
+        }
+
+        // Mark as filled if complete
+        if order.filled >= order.amount {
+            order.status = 1;
+        }
+        if existing.filled >= existing.amount {
+            existing.status = 1;
+        }
+
+        self.orders.insert(order_id, order);
+        self.orders.insert(existing_id, existing);
+
+        emit OrderFilled {
+            id: order_id,
+            filled_amount: amount,
+            remaining: order.amount - order.filled,
+        };
+
+        emit OrderFilled {
+            id: existing_id,
+            filled_amount: amount,
+            remaining: existing.amount - existing.filled,
+        };
+    }
+
+    // Get order details
+    fn get_order(order_id: u256) -> Option<Order> {
+        return self.orders.get(order_id);
+    }
+
+    // Get trader's orders
+    fn get_trader_orders(trader: Address) -> Vec<u256> {
+        return self.trader_orders.get(trader).unwrap_or(Vec::new());
+    }
+
+    // Get order book depth
+    fn get_depth(token_a: Address, token_b: Address) -> (Vec<(u256, u256)>, Vec<(u256, u256)>) {
+        let buy_depth = Vec::new();
+        let sell_depth = Vec::new();
+
+        // Iterate buy levels using stored price list
+        let buy_len = self.buy_price_list.len();
+        let mut b = 0;
+        while b < buy_len {
+            let price = self.buy_price_list[b];
+            let orders = self.buy_levels.get(price).unwrap_or(Vec::new());
+            let mut total = 0;
+            let o_len = orders.len();
+            let mut o = 0;
+            while o < o_len {
+                let id = orders[o];
+                let order = self.orders.get(id).unwrap();
+                if order.status == 0 {
+                    total += order.amount - order.filled;
+                }
+                o += 1;
+            }
+            if total > 0 {
+                buy_depth.push((price, total));
+            }
+            b += 1;
+        }
+
+        // Iterate sell levels
+        let sell_len = self.sell_price_list.len();
+        let mut s = 0;
+        while s < sell_len {
+            let price = self.sell_price_list[s];
+            let orders = self.sell_levels.get(price).unwrap_or(Vec::new());
+            let mut total = 0;
+            let o_len = orders.len();
+            let mut o = 0;
+            while o < o_len {
+                let id = orders[o];
+                let order = self.orders.get(id).unwrap();
+                if order.status == 0 {
+                    total += order.amount - order.filled;
+                }
+                o += 1;
+            }
+            if total > 0 {
+                sell_depth.push((price, total));
+            }
+            s += 1;
+        }
+
+        return (buy_depth, sell_depth);
+    }
+
+    // Helper: check if price is already in list
+    fn price_in_list(list: Vec<u256>, price: u256) -> bool {
+        let len = list.len();
+        let mut i = 0;
+        while i < len {
+            if list[i] == price {
+                return true;
+            }
+            i += 1;
+        }
+        return false;
+    }
+
+    // Helper: sort ascending (bubble sort — acceptable for small lists)
+    fn sort_ascending(list: Vec<u256>) {
+        let len = list.len();
+        if len <= 1 {
+            return;
+        }
+        let mut i = 0;
+        while i < len - 1 {
+            let mut j = i + 1;
+            while j < len {
+                if list[i] > list[j] {
+                    let temp = list[i];
+                    list[i] = list[j];
+                    list[j] = temp;
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+    }
+
+    // Helper: sort descending
+    fn sort_descending(list: Vec<u256>) {
+        let len = list.len();
+        if len <= 1 {
+            return;
+        }
+        let mut i = 0;
+        while i < len - 1 {
+            let mut j = i + 1;
+            while j < len {
+                if list[i] < list[j] {
+                    let temp = list[i];
+                    list[i] = list[j];
+                    list[j] = temp;
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+    }
+}

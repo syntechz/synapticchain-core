@@ -1,0 +1,321 @@
+// SynapticChain DEX - Pool Contract (Constant Product AMM)
+// x * y = k formula with 0.3% swap fee
+
+#[state]
+contract Pool {
+    #[persistent]
+    let token0: Address;
+    #[persistent]
+    let token1: Address;
+    #[persistent]
+    let fee_numerator: u16;        // e.g., 30 = 0.3%
+    #[persistent]
+    let factory: Address;
+
+    // Reserves
+    #[persistent]
+    let reserve0: u256 = 0;
+
+    #[persistent]
+    let reserve1: u256 = 0;
+
+    // LP token total supply
+    #[persistent]
+    let total_supply: u256 = 0;
+
+    // LP balances
+    #[persistent]
+    map lp_balances: Map<Address, u256>;
+
+    // TWAP accumulators
+    #[persistent]
+    let price0_cumulative: u256 = 0;
+
+    #[persistent]
+    let price1_cumulative: u256 = 0;
+
+    #[persistent]
+    let block_timestamp_last: u64 = 0;
+
+    // Protocol fee tracking
+    #[persistent]
+    let fee0_growth: u256 = 0;
+
+    #[persistent]
+    let fee1_growth: u256 = 0;
+
+    // Events
+    event Swap {
+        sender: Address,
+        amount0_in: u256,
+        amount1_in: u256,
+        amount0_out: u256,
+        amount1_out: u256,
+        to: Address,
+    }
+
+    event LiquidityAdded {
+        sender: Address,
+        amount0: u256,
+        amount1: u256,
+        lp_tokens: u256,
+    }
+
+    event LiquidityRemoved {
+        sender: Address,
+        amount0: u256,
+        amount1: u256,
+        lp_tokens: u256,
+    }
+
+    event Sync {
+        reserve0: u256,
+        reserve1: u256,
+    }
+
+    // Initialize pool
+    #[init]
+    fn new(token0_addr: Address, token1_addr: Address, fee: u16, factory_addr: Address) {
+        self.token0 = token0_addr;
+        self.token1 = token1_addr;
+        self.fee_numerator = fee;
+        self.factory = factory_addr;
+    }
+
+    // Get current reserves
+    fn get_reserves() -> (u256, u256, u64) {
+        return (self.reserve0, self.reserve1, self.block_timestamp_last);
+    }
+
+    // Get token0
+    fn get_token0() -> Address {
+        return self.token0;
+    }
+
+    // Get token1
+    fn get_token1() -> Address {
+        return self.token1;
+    }
+
+    // Get fee numerator
+    fn get_fee() -> u16 {
+        return self.fee_numerator;
+    }
+
+    // Get factory address
+    fn get_factory() -> Address {
+        return self.factory;
+    }
+
+    // Get fee growth (for FeeCollector)
+    fn get_fee0_growth() -> u256 {
+        return self.fee0_growth;
+    }
+
+    fn get_fee1_growth() -> u256 {
+        return self.fee1_growth;
+    }
+
+    // Reset fee growth (called by FeeCollector only)
+    fn reset_fee0() {
+        verify msg.sender == self.factory, "UNAUTHORIZED";
+        self.fee0_growth = 0;
+    }
+
+    fn reset_fee1() {
+        verify msg.sender == self.factory, "UNAUTHORIZED";
+        self.fee1_growth = 0;
+    }
+
+    // Add liquidity
+    #[payable]
+    fn add_liquidity(amount0_desired: u256, amount1_desired: u256, min_lp: u256, to: Address) -> u256 {
+        let lp_amount: u256;
+        let amount0: u256;
+        let amount1: u256;
+
+        if self.total_supply == 0 {
+            // First liquidity provision - use geometric mean
+            amount0 = amount0_desired;
+            amount1 = amount1_desired;
+            lp_amount = math::sqrt(amount0 * amount1);
+            verify lp_amount > 1000, "MINIMUM_LIQUIDITY";
+
+            // Mint minimum liquidity to zero address (permanent lock)
+            self.lp_balances.insert(Address::zero(), 1000);
+            lp_amount -= 1000;
+        } else {
+            // Calculate optimal amounts based on existing ratio
+            let optimal1 = (amount0_desired * self.reserve1) / self.reserve0;
+            let optimal0 = (amount1_desired * self.reserve0) / self.reserve1;
+
+            if amount1_desired >= optimal1 {
+                amount0 = amount0_desired;
+                amount1 = optimal1;
+            } else {
+                amount0 = optimal0;
+                amount1 = amount1_desired;
+            }
+
+            lp_amount = math::min(
+                (amount0 * self.total_supply) / self.reserve0,
+                (amount1 * self.total_supply) / self.reserve1
+            );
+        }
+
+        verify lp_amount >= min_lp, "INSUFFICIENT_LP";
+
+        // Transfer tokens to pool
+        Token::transfer_from(self.token0, msg.sender, self, amount0);
+        Token::transfer_from(self.token1, msg.sender, self, amount1);
+
+        // Update reserves
+        self.reserve0 += amount0;
+        self.reserve1 += amount1;
+        self.total_supply += lp_amount;
+
+        // Mint LP tokens
+        let existing = self.lp_balances.get(to).unwrap_or(0);
+        self.lp_balances.insert(to, existing + lp_amount);
+
+        // Update TWAP
+        self.update_cumulative();
+
+        emit LiquidityAdded { sender: msg.sender, amount0, amount1, lp_tokens: lp_amount };
+        emit Sync { reserve0: self.reserve0, reserve1: self.reserve1 };
+
+        return lp_amount;
+    }
+
+    // Remove liquidity
+    fn remove_liquidity(lp_amount: u256, min0: u256, min1: u256, to: Address) -> (u256, u256) {
+        // Calculate proportional amounts
+        let amount0 = (lp_amount * self.reserve0) / self.total_supply;
+        let amount1 = (lp_amount * self.reserve1) / self.total_supply;
+
+        verify amount0 >= min0 && amount1 >= min1, "SLIPPAGE_EXCEEDED";
+
+        // Burn LP tokens
+        let sender_balance = self.lp_balances.get(msg.sender).unwrap_or(0);
+        verify sender_balance >= lp_amount, "INSUFFICIENT_LP_BALANCE";
+        self.lp_balances.insert(msg.sender, sender_balance - lp_amount);
+        self.total_supply -= lp_amount;
+
+        // Update reserves
+        self.reserve0 -= amount0;
+        self.reserve1 -= amount1;
+
+        // Transfer tokens out
+        Token::transfer(self.token0, to, amount0);
+        Token::transfer(self.token1, to, amount1);
+
+        // Update TWAP
+        self.update_cumulative();
+
+        emit LiquidityRemoved { sender: msg.sender, amount0, amount1, lp_tokens: lp_amount };
+        emit Sync { reserve0: self.reserve0, reserve1: self.reserve1 };
+
+        return (amount0, amount1);
+    }
+
+    // Swap tokens
+    #[payable]
+    fn swap(amount0_out: u256, amount1_out: u256, to: Address) {
+        verify amount0_out > 0 || amount1_out > 0, "INVALID_OUTPUT";
+        verify amount0_out < self.reserve0 && amount1_out < self.reserve1, "INSUFFICIENT_LIQUIDITY";
+
+        let token0 = self.token0;
+        let token1 = self.token1;
+
+        verify to != token0 && to != token1, "INVALID_TO";
+
+        // Transfer output tokens
+        if amount0_out > 0 {
+            Token::transfer(token0, to, amount0_out);
+        }
+        if amount1_out > 0 {
+            Token::transfer(token1, to, amount1_out);
+        }
+
+        // Calculate amounts in (from token balances)
+        let balance0 = Token::balance_of(token0, self);
+        let balance1 = Token::balance_of(token1, self);
+
+        let amount0_in = if balance0 > self.reserve0 - amount0_out {
+            balance0 - (self.reserve0 - amount0_out)
+        } else {
+            0
+        };
+
+        let amount1_in = if balance1 > self.reserve1 - amount1_out {
+            balance1 - (self.reserve1 - amount1_out)
+        } else {
+            0
+        };
+
+        verify amount0_in > 0 || amount1_in > 0, "INSUFFICIENT_INPUT";
+
+        // Verify constant product formula with fee
+        let fee = self.fee_numerator;
+        let balance0_adjusted = balance0 * 1000 - amount0_in * fee;
+        let balance1_adjusted = balance1 * 1000 - amount1_in * fee;
+
+        verify balance0_adjusted * balance1_adjusted >= self.reserve0 * self.reserve1 * 1000 * 1000, "K_ERROR";
+
+        // Update reserves
+        self.reserve0 = balance0;
+        self.reserve1 = balance1;
+
+        // Update TWAP
+        self.update_cumulative();
+
+        emit Swap {
+            sender: msg.sender,
+            amount0_in,
+            amount1_in,
+            amount0_out,
+            amount1_out,
+            to,
+        };
+        emit Sync { reserve0: self.reserve0, reserve1: self.reserve1 };
+    }
+
+    // Calculate output amount for swap
+    fn get_amount_out(amount_in: u256, reserve_in: u256, reserve_out: u256) -> u256 {
+        verify amount_in > 0, "INSUFFICIENT_INPUT";
+        verify reserve_in > 0 && reserve_out > 0, "INSUFFICIENT_LIQUIDITY";
+
+        let fee = self.fee_numerator;
+        let amount_in_with_fee = amount_in * (1000 - fee);
+        let numerator = amount_in_with_fee * reserve_out;
+        let denominator = reserve_in * 1000 + amount_in_with_fee;
+
+        return numerator / denominator;
+    }
+
+    // Update TWAP accumulators
+    fn update_cumulative() {
+        let now = block::timestamp();
+        let time_elapsed = now - self.block_timestamp_last;
+
+        if time_elapsed > 0 && self.reserve0 > 0 && self.reserve1 > 0 {
+            self.price0_cumulative += (self.reserve1 * u256::from(time_elapsed)) / self.reserve0;
+            self.price1_cumulative += (self.reserve0 * u256::from(time_elapsed)) / self.reserve1;
+        }
+
+        self.block_timestamp_last = now;
+    }
+
+    // Get LP balance for address
+    fn lp_balance_of(owner: Address) -> u256 {
+        return self.lp_balances.get(owner).unwrap_or(0);
+    }
+
+    // Sync reserves with actual balances (emergency use)
+    fn sync() {
+        self.reserve0 = Token::balance_of(self.token0, self);
+        self.reserve1 = Token::balance_of(self.token1, self);
+        self.update_cumulative();
+        emit Sync { reserve0: self.reserve0, reserve1: self.reserve1 };
+    }
+}

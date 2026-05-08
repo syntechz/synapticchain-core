@@ -1,0 +1,92 @@
+// SynapticChain DEX - Factory Contract
+// Creates and tracks AMM pools
+
+#[state]
+contract Factory {
+    #[persistent]
+    let protocol_fee: u16 = 30;        // 0.3% default fee
+    #[persistent]
+    let fee_recipient: Address;         // Protocol treasury address
+    #[persistent]
+    let owner: Address;                 // Contract owner
+
+    // Mapping: (token0, token1) => pool_address
+    #[persistent]
+    map pools: Map<(Address, Address), Address>;
+
+    #[persistent]
+    map pool_count: u64 = 0;
+
+    // Events
+    event PoolCreated {
+        token0: Address,
+        token1: Address,
+        pool: Address,
+        fee: u16,
+    }
+
+    // Initialize factory with owner and fee recipient
+    #[init]
+    fn new(owner_addr: Address, fee_recipient_addr: Address) {
+        self.owner = owner_addr;
+        self.fee_recipient = fee_recipient_addr;
+    }
+
+    // Create a new pool for token pair
+    #[payable]
+    fn create_pool(token_a: Address, token_b: Address, fee: u16) -> Address {
+        // Sort tokens to ensure consistent ordering
+        let (token0, token1) = if token_a < token_b {
+            (token_a, token_b)
+        } else {
+            (token_b, token_a)
+        };
+
+        verify token0 != token1, "IDENTICAL_ADDRESSES";
+        verify token0 != Address::zero(), "ZERO_ADDRESS";
+        verify self.pools.get((token0, token1)) == None, "POOL_EXISTS";
+
+        // Deploy new Pool contract
+        let pool = deploy::Pool::new(token0, token1, fee, Address::from(self));
+
+        // Register pool
+        self.pools.insert((token0, token1), pool);
+        self.pools.insert((token1, token0), pool);  // Bidirectional lookup
+        self.pool_count += 1;
+
+        emit PoolCreated { token0, token1, pool, fee };
+
+        return pool;
+    }
+
+    // Get pool address for token pair
+    fn get_pool(token_a: Address, token_b: Address) -> Option<Address> {
+        let (token0, token1) = if token_a < token_b {
+            (token_a, token_b)
+        } else {
+            (token_b, token_a)
+        };
+        return self.pools.get((token0, token1));
+    }
+
+    // Get total number of pools
+    fn get_pool_count() -> u64 {
+        return self.pool_count;
+    }
+
+    // Set protocol fee recipient (owner only)
+    fn set_fee_recipient(new_recipient: Address) {
+        verify msg.sender == self.owner, "UNAUTHORIZED";
+        self.fee_recipient = new_recipient;
+    }
+
+    // Get fee recipient
+    fn get_fee_recipient() -> Address {
+        return self.fee_recipient;
+    }
+
+    // Get owner
+    fn get_owner() -> Address {
+        return self.owner;
+    }
+}

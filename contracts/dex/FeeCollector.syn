@@ -1,0 +1,132 @@
+// SynapticChain DEX - FeeCollector Contract
+// Distributes fees between LPs, protocol, and burn
+
+#[state]
+contract FeeCollector {
+    #[persistent]
+    let factory: Address;
+    #[persistent]
+    let treasury: Address;
+    #[persistent]
+    let burn_address: Address;  // Address(0) for burn
+    #[persistent]
+    let owner: Address;
+
+    // Fee split percentages (basis points: 10000 = 100%)
+    #[persistent]
+    let lp_share: u16 = 8333;        // 83.33% to LPs
+    #[persistent]
+    let treasury_share: u16 = 1667;  // 16.67% to treasury
+
+    #[persistent]
+    let total_fees_collected: u256 = 0;
+
+    #[persistent]
+    map collected_fees: Map<Address, u256>;  // token => amount
+
+    // Events
+    event FeesDistributed {
+        token: Address,
+        lp_amount: u256,
+        treasury_amount: u256,
+        total: u256,
+    }
+
+    event FeesBurned {
+        token: Address,
+        amount: u256,
+    }
+
+    #[init]
+    fn new(factory_addr: Address, treasury_addr: Address, owner_addr: Address) {
+        self.factory = factory_addr;
+        self.treasury = treasury_addr;
+        self.burn_address = Address::zero();
+        self.owner = owner_addr;
+    }
+
+    // Collect fees from a pool
+    fn collect_fees(pool: Address) {
+        let token0 = Pool::get_token0(pool);
+        let token1 = Pool::get_token1(pool);
+
+        // Collect accumulated protocol fees
+        let fee0 = Pool::get_fee0_growth(pool);
+        let fee1 = Pool::get_fee1_growth(pool);
+
+        if fee0 > 0 {
+            self.distribute(token0, fee0);
+            Pool::reset_fee0(pool);
+        }
+
+        if fee1 > 0 {
+            self.distribute(token1, fee1);
+            Pool::reset_fee1(pool);
+        }
+    }
+
+    // Distribute collected fees
+    fn distribute(token: Address, amount: u256) {
+        verify amount > 0, "ZERO_AMOUNT";
+
+        let lp_amount = (amount * self.lp_share) / 10000;
+        let treasury_amount = amount - lp_amount;  // Remainder goes to treasury
+
+        // Transfer to treasury
+        Token::transfer(token, self.treasury, treasury_amount);
+
+        // LP fees stay in pool (implicit in reserve growth)
+        // No explicit transfer needed for LP portion
+
+        self.total_fees_collected += amount;
+        let existing = self.collected_fees.get(token).unwrap_or(0);
+        self.collected_fees.insert(token, existing + amount);
+
+        emit FeesDistributed {
+            token,
+            lp_amount,
+            treasury_amount,
+            total: amount,
+        };
+    }
+
+    // Burn tokens (deflationary mechanism)
+    fn burn(token: Address, amount: u256) {
+        verify amount > 0, "ZERO_AMOUNT";
+
+        // Transfer to zero address (burn)
+        Token::transfer(token, self.burn_address, amount);
+
+        emit FeesBurned { token, amount };
+    }
+
+    // Set fee shares (owner only)
+    fn set_shares(new_lp: u16, new_treasury: u16) {
+        verify msg.sender == self.owner, "UNAUTHORIZED";
+        verify new_lp + new_treasury == 10000, "INVALID_SPLIT";
+
+        self.lp_share = new_lp;
+        self.treasury_share = new_treasury;
+    }
+
+    // Get accumulated fees for a token
+    fn get_fees(token: Address) -> u256 {
+        return self.collected_fees.get(token).unwrap_or(0);
+    }
+
+    // Get total fees collected
+    fn get_total_fees() -> u256 {
+        return self.total_fees_collected;
+    }
+
+    // Get fee split
+    fn get_shares() -> (u16, u16) {
+        return (self.lp_share, self.treasury_share);
+    }
+
+    // Emergency withdrawal (owner only)
+    fn emergency_withdraw(token: Address, to: Address, amount: u256) {
+        verify msg.sender == self.owner, "UNAUTHORIZED";
+        Token::transfer(token, to, amount);
+    }
+}
