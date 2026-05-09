@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Check SynLang contract syntax
+      run: |
+        echo "TODO: Add SynLang compiler here"
+        echo "For now, verifying .syn files exist and are non-empty"
+        find contracts -name "*.syn" | xargs -I{} sh -c 'echo "Checking {}" && [ -s {} ]'
+    - name: Verify plan files
+      run: |
+        find contracts -name "*.plan" | xargs -I{} sh -c 'echo "Checking {}" && [ -s {} ]'
+
+  deploy:
+    needs: contracts
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Deploy to testnet
+      run: echo "TODO: Add testnet deployment script"
