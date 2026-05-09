@@ -1,0 +1,642 @@
+// SynapticChain Lending Protocol — Over-Collateralized Deposit/Borrow
+// Version: 1.0 | Compile-target: SynapticLang v2
+
+#[state]
+struct LendingProtocol {
+    // --- Core storage ---
+    reserves: Map<Address, Reserve>,
+    deposits: Map<(Address, Address), u128>,     // (token, user) -> aToken shares
+    borrows: Map<(Address, Address), u128>,      // (token, user) -> borrow principal
+    collateral_tokens: Map<Address, Vec<Address>>, // user -> collateral list (max 5)
+    
+    // --- Interest rate indices ---
+    borrow_indices: Map<Address, u128>,         // token -> cumulative borrow index (1e18 base)
+    liquidity_indices: Map<Address, u128>,       // token -> cumulative liquidity index (1e18 base)
+    last_accrual: Map<Address, u64>,             // token -> last interest accrual timestamp
+    
+    // --- Oracle prices (8 decimals) ---
+    prices: Map<Address, u128>,
+    price_oracle: Address,
+    
+    // --- Admin ---
+    admin: Address,
+    paused: bool,
+    
+    // --- Constants ---
+    const INDEX_BASE: u128 = 1_000_000_000_000_000_000,  // 1e18
+    const CLOSE_FACTOR: u128 = 5000,                       // 50% = 5000/10000
+    const LIQUIDATION_BONUS: u128 = 10500,                 // 5% bonus = 10500/10000
+    const MAX_COLLATERAL_TOKENS: u8 = 5,
+    const HF_THRESHOLD: u128 = 1_000_000_000_000_000_000, // 1.0 * 1e18
+}
+
+// --- Data Structures ---
+
+struct Reserve {
+    token: Address,
+    total_liquidity: u128,
+    total_borrows: u128,
+    borrow_rate: u128,           // per-second rate * 1e18
+    supply_rate: u128,           // per-second rate * 1e18
+    
+    // --- Interest rate model params ---
+    base_rate: u128,
+    slope1: u128,
+    slope2: u128,
+    optimal_utilization: u128,
+    reserve_factor: u128,        // protocol fee on interest (e.g. 1000 = 10%)
+    
+    // --- Caps ---
+    borrow_cap: u128,
+    supply_cap: u128,
+    
+    // --- Flags ---
+    ltv: u16,                    // loan-to-value (e.g. 7500 = 75%)
+    liquidation_threshold: u16,  // when HF drops below this
+    is_active: bool,
+    is_frozen: bool,
+    is_borrowable: bool,
+}
+
+struct ReserveConfigInput {
+    ltv: u16,
+    liquidation_threshold: u16,
+    borrow_cap: u128,
+    supply_cap: u128,
+    reserve_factor: u128,
+    base_rate: u128,
+    slope1: u128,
+    slope2: u128,
+    optimal_utilization: u128,
+    is_borrowable: bool,
+}
+
+struct UserAccountData {
+    total_collateral_usd: u128,
+    total_debt_usd: u128,
+    available_borrows_usd: u128,
+    health_factor: u128,
+    liquidation_threshold: u16,
+}
+
+// --- Events ---
+
+event Deposit {
+    token: Address,
+    user: Address,
+    amount: u128,
+    shares: u128,
+}
+
+event Withdraw {
+    token: Address,
+    user: Address,
+    amount: u128,
+    shares: u128,
+}
+
+event Borrow {
+    token: Address,
+    user: Address,
+    amount: u128,
+    borrow_index: u128,
+}
+
+event Repay {
+    token: Address,
+    user: Address,
+    amount: u128,
+    remaining_debt: u128,
+}
+
+event Liquidation {
+    user: Address,
+    liquidator: Address,
+    collateral_token: Address,
+    debt_token: Address,
+    debt_covered: u128,
+    collateral_seized: u128,
+}
+
+event ReserveConfigUpdated {
+    token: Address,
+    ltv: u16,
+    liquidation_threshold: u16,
+    borrow_cap: u128,
+    supply_cap: u128,
+    reserve_factor: u128,
+}
+
+event PriceUpdated {
+    token: Address,
+    price: u128,
+}
+
+event InterestAccrued {
+    token: Address,
+    borrow_index: u128,
+    liquidity_index: u128,
+    total_borrows: u128,
+}
+
+// --- Access Control ---
+
+fn verify_not_paused() {
+    verify !self.paused, "PAUSED";
+}
+
+fn verify_only_admin() {
+    verify msg.sender == self.admin, "UNAUTHORIZED";
+}
+
+fn verify_only_oracle() {
+    verify msg.sender == self.price_oracle, "UNAUTHORIZED_ORACLE";
+}
+
+// --- Interest Rate Math ---
+
+fn calculate_borrow_rate(reserve: &Reserve) -> u128 {
+    let total_liquidity = reserve.total_liquidity + reserve.total_borrows;
+    if total_liquidity == 0 {
+        return reserve.base_rate;
+    }
+    
+    let utilization = reserve.total_borrows * self.INDEX_BASE / total_liquidity;
+    
+    if utilization <= reserve.optimal_utilization {
+        reserve.base_rate + utilization * reserve.slope1 / reserve.optimal_utilization
+    } else {
+        reserve.base_rate + reserve.slope1 + 
+            (utilization - reserve.optimal_utilization) * reserve.slope2 / (self.INDEX_BASE - reserve.optimal_utilization)
+    }
+}
+
+fn calculate_supply_rate(borrow_rate: u128, utilization: u128, reserve_factor: u128) -> u128 {
+    borrow_rate * utilization * (self.INDEX_BASE - reserve_factor) / self.INDEX_BASE / self.INDEX_BASE
+}
+
+fn accrue_interest(token: Address) {
+    let mut reserve = self.reserves.get(token).unwrap();
+    if !reserve.is_active {
+        return;
+    }
+    
+    let now = block.timestamp;
+    let last = self.last_accrual.get(token).unwrap_or(now);
+    let delta = now - last;
+    
+    if delta == 0 || reserve.total_borrows == 0 {
+        self.last_accrual.insert(token, now);
+        return;
+    }
+    
+    let borrow_rate = calculate_borrow_rate(&reserve);
+    let cumulative_borrow_rate = borrow_rate * delta as u128;
+    
+    let current_borrow_index = self.borrow_indices.get(token).unwrap_or(self.INDEX_BASE);
+    let new_borrow_index = current_borrow_index + current_borrow_index * cumulative_borrow_rate / self.INDEX_BASE;
+    
+    let interest_accumulated = reserve.total_borrows * new_borrow_index / current_borrow_index - reserve.total_borrows;
+    let reserve_factor_amount = interest_accumulated * reserve.reserve_factor / self.INDEX_BASE;
+    let liquidity_increase = interest_accumulated - reserve_factor_amount;
+    
+    reserve.total_borrows += interest_accumulated;
+    reserve.total_liquidity += liquidity_increase;
+    
+    let current_liquidity_index = self.liquidity_indices.get(token).unwrap_or(self.INDEX_BASE);
+    let new_liquidity_index = current_liquidity_index + current_liquidity_index * liquidity_increase / reserve.total_liquidity;
+    
+    self.borrow_indices.insert(token, new_borrow_index);
+    self.liquidity_indices.insert(token, new_liquidity_index);
+    self.last_accrual.insert(token, now);
+    self.reserves.insert(token, reserve);
+    
+    emit InterestAccrued {
+        token,
+        borrow_index: new_borrow_index,
+        liquidity_index: new_liquidity_index,
+        total_borrows: reserve.total_borrows,
+    };
+}
+
+// --- Health Factor ---
+
+fn get_user_health_factor(user: Address) -> (u128, u128, u128, u16) {
+    let collateral_list = self.collateral_tokens.get(user).unwrap_or(Vec::new());
+    
+    let mut total_collateral_usd: u128 = 0;
+    let mut total_collateral_adjusted: u128 = 0;
+    let mut total_debt_usd: u128 = 0;
+    let mut liquidation_threshold_weighted: u128 = 0;
+    
+    // Sum deposits
+    for i in 0..collateral_list.len() {
+        if i >= self.MAX_COLLATERAL_TOKENS as usize {
+            break;
+        }
+        let token = collateral_list[i];
+        let deposit_shares = self.deposits.get((token, user)).unwrap_or(0);
+        if deposit_shares == 0 {
+            continue;
+        }
+        
+        let reserve = self.reserves.get(token).unwrap();
+        let price = self.prices.get(token).unwrap_or(0);
+        let liquidity_index = self.liquidity_indices.get(token).unwrap_or(self.INDEX_BASE);
+        
+        let underlying = deposit_shares * liquidity_index / self.INDEX_BASE;
+        let usd_value = underlying * price / 1_000_000_00; // price has 8 decimals
+        
+        total_collateral_usd += usd_value;
+        total_collateral_adjusted += usd_value * reserve.ltv as u128 / 10000;
+        liquidation_threshold_weighted += usd_value * reserve.liquidation_threshold as u128 / 10000;
+    }
+    
+    // Sum borrows
+    let borrow_tokens = self.get_user_borrow_tokens(user); // bounded by active reserves
+    for token in borrow_tokens.iter() {
+        let borrow_principal = self.borrows.get((*token, user)).unwrap_or(0);
+        if borrow_principal == 0 {
+            continue;
+        }
+        
+        let price = self.prices.get(*token).unwrap_or(0);
+        let borrow_index = self.borrow_indices.get(*token).unwrap_or(self.INDEX_BASE);
+        
+        let current_debt = borrow_principal * borrow_index / self.INDEX_BASE;
+        let usd_value = current_debt * price / 1_000_000_00;
+        total_debt_usd += usd_value;
+    }
+    
+    let health_factor: u128;
+    if total_debt_usd == 0 {
+        health_factor = u128::MAX;
+    } else {
+        health_factor = liquidation_threshold_weighted * self.INDEX_BASE / total_debt_usd;
+    }
+    
+    let avg_liquidation_threshold: u16;
+    if total_collateral_usd > 0 {
+        avg_liquidation_threshold = (liquidation_threshold_weighted * 10000 / total_collateral_usd) as u16;
+    } else {
+        avg_liquidation_threshold = 0;
+    }
+    
+    (health_factor, total_collateral_usd, total_debt_usd, avg_liquidation_threshold)
+}
+
+// Note: In production, maintain a separate user_borrow_tokens map
+fn get_user_borrow_tokens(user: Address) -> Vec<Address> {
+    let mut tokens = Vec::new();
+    // This is a simplified placeholder. In production, track per-user borrow tokens.
+    tokens
+}
+
+// --- Entry Functions ---
+
+#[gas_limit(6000)]
+fn deposit(token: Address, amount: u128) {
+    verify_not_paused();
+    let reserve = self.reserves.get(token).unwrap();
+    verify reserve.is_active, "RESERVE_NOT_ACTIVE";
+    verify !reserve.is_frozen, "RESERVE_FROZEN";
+    
+    accrue_interest(token);
+    
+    let liquidity_index = self.liquidity_indices.get(token).unwrap_or(self.INDEX_BASE);
+    let total_liquidity = reserve.total_liquidity;
+    let total_a_tokens = reserve.total_liquidity; // aTokens 1:1 with liquidity for simplicity
+    
+    let shares: u128;
+    if total_a_tokens == 0 {
+        shares = amount;
+    } else {
+        shares = amount * total_a_tokens / total_liquidity;
+    }
+    
+    verify shares > 0, "INVALID_SHARES";
+    verify reserve.total_liquidity + amount <= reserve.supply_cap, "SUPPLY_CAP_EXCEEDED";
+    
+    // Transfer from sender
+    Token::transfer_from(token, msg.sender, Address::from(self), amount);
+    
+    // Mint aTokens (deposit shares)
+    let current_deposit = self.deposits.get((token, msg.sender)).unwrap_or(0);
+    self.deposits.insert((token, msg.sender), current_deposit + shares);
+    
+    // Update reserve
+    let mut reserve = self.reserves.get(token).unwrap();
+    reserve.total_liquidity += amount;
+    self.reserves.insert(token, reserve);
+    
+    // Add to collateral list if first deposit
+    let mut collateral_list = self.collateral_tokens.get(msg.sender).unwrap_or(Vec::new());
+    let mut already_collateral = false;
+    for i in 0..collateral_list.len() {
+        if collateral_list[i] == token {
+            already_collateral = true;
+            break;
+        }
+    }
+    if !already_collateral {
+        verify collateral_list.len() < self.MAX_COLLATERAL_TOKENS as usize, "MAX_COLLATERAL_REACHED";
+        collateral_list.push(token);
+        self.collateral_tokens.insert(msg.sender, collateral_list);
+    }
+    
+    emit Deposit { token, user: msg.sender, amount, shares };
+}
+
+#[gas_limit(8000)]
+fn withdraw(token: Address, amount: u128) {
+    verify_not_paused();
+    accrue_interest(token);
+    
+    let liquidity_index = self.liquidity_indices.get(token).unwrap_or(self.INDEX_BASE);
+    let deposit_shares = self.deposits.get((token, msg.sender)).unwrap_or(0);
+    let underlying = deposit_shares * liquidity_index / self.INDEX_BASE;
+    
+    verify underlying >= amount, "INSUFFICIENT_BALANCE";
+    
+    // Health factor check after withdrawal
+    let (hf_before, _, _, _) = get_user_health_factor(msg.sender);
+    
+    // Calculate shares to burn
+    let shares_to_burn = amount * self.INDEX_BASE / liquidity_index;
+    
+    // Update deposit
+    self.deposits.insert((token, msg.sender), deposit_shares - shares_to_burn);
+    
+    // Update reserve
+    let mut reserve = self.reserves.get(token).unwrap();
+    reserve.total_liquidity -= amount;
+    self.reserves.insert(token, reserve);
+    
+    // Check HF after
+    let (hf_after, _, _, _) = get_user_health_factor(msg.sender);
+    if hf_before >= self.HF_THRESHOLD {
+        verify hf_after >= self.HF_THRESHOLD, "HEALTH_FACTOR_TOO_LOW";
+    }
+    
+    // Transfer out
+    Token::transfer(token, msg.sender, amount);
+    
+    emit Withdraw { token, user: msg.sender, amount, shares: shares_to_burn };
+}
+
+#[gas_limit(8000)]
+fn borrow(token: Address, amount: u128) {
+    verify_not_paused();
+    let reserve = self.reserves.get(token).unwrap();
+    verify reserve.is_active && reserve.is_borrowable, "BORROWING_NOT_ALLOWED";
+    verify !reserve.is_frozen, "RESERVE_FROZEN";
+    
+    accrue_interest(token);
+    
+    verify reserve.total_borrows + amount <= reserve.borrow_cap, "BORROW_CAP_EXCEEDED";
+    
+    // Health factor check
+    let (hf, total_collateral, total_debt, _) = get_user_health_factor(msg.sender);
+    verify hf >= self.HF_THRESHOLD, "HEALTH_FACTOR_TOO_LOW";
+    
+    let price = self.prices.get(token).unwrap_or(0);
+    let borrow_value = amount * price / 1_000_000_00;
+    let available_borrows = total_collateral * reserve.ltv as u128 / 10000 - total_debt;
+    verify borrow_value <= available_borrows, "INSUFFICIENT_COLLATERAL";
+    
+    let borrow_index = self.borrow_indices.get(token).unwrap_or(self.INDEX_BASE);
+    
+    // Record borrow
+    let current_borrow = self.borrows.get((token, msg.sender)).unwrap_or(0);
+    let new_principal = current_borrow + amount * self.INDEX_BASE / borrow_index;
+    self.borrows.insert((token, msg.sender), new_principal);
+    
+    // Update reserve
+    let mut reserve = self.reserves.get(token).unwrap();
+    reserve.total_borrows += amount;
+    self.reserves.insert(token, reserve);
+    
+    // Transfer to borrower
+    Token::transfer(token, msg.sender, amount);
+    
+    emit Borrow { token, user: msg.sender, amount, borrow_index };
+}
+
+#[gas_limit(6000)]
+fn repay(token: Address, amount: u128) {
+    verify_not_paused();
+    accrue_interest(token);
+    
+    let borrow_index = self.borrow_indices.get(token).unwrap_or(self.INDEX_BASE);
+    let borrow_principal = self.borrows.get((token, msg.sender)).unwrap_or(0);
+    let current_debt = borrow_principal * borrow_index / self.INDEX_BASE;
+    
+    verify current_debt > 0, "NO_DEBT";
+    
+    let repay_amount = amount.min(current_debt);
+    let principal_repaid = repay_amount * self.INDEX_BASE / borrow_index;
+    
+    // Transfer from sender
+    Token::transfer_from(token, msg.sender, Address::from(self), repay_amount);
+    
+    // Update borrow
+    self.borrows.insert((token, msg.sender), borrow_principal - principal_repaid);
+    
+    // Update reserve
+    let mut reserve = self.reserves.get(token).unwrap();
+    reserve.total_borrows -= repay_amount;
+    self.reserves.insert(token, reserve);
+    
+    let remaining = current_debt - repay_amount;
+    emit Repay { token, user: msg.sender, amount: repay_amount, remaining_debt: remaining };
+}
+
+#[gas_limit(10000)]
+fn liquidate(user: Address, collateral_token: Address, debt_token: Address, debt_to_cover: u128) {
+    verify_not_paused();
+    verify user != msg.sender, "SELF_LIQUIDATION";
+    
+    accrue_interest(debt_token);
+    accrue_interest(collateral_token);
+    
+    // Verify user is underwater
+    let (hf, _, _, _) = get_user_health_factor(user);
+    verify hf < self.HF_THRESHOLD, "HEALTH_FACTOR_OK";
+    
+    let borrow_index = self.borrow_indices.get(debt_token).unwrap_or(self.INDEX_BASE);
+    let borrow_principal = self.borrows.get((debt_token, user)).unwrap_or(0);
+    let current_debt = borrow_principal * borrow_index / self.INDEX_BASE;
+    
+    verify current_debt > 0, "NO_DEBT";
+    
+    // Max 50% of debt
+    let max_debt = current_debt * self.CLOSE_FACTOR / 10000;
+    let actual_debt = debt_to_cover.min(max_debt);
+    
+    let debt_price = self.prices.get(debt_token).unwrap_or(0);
+    let collateral_price = self.prices.get(collateral_token).unwrap_or(0);
+    
+    // Collateral to seize = debt_value / collateral_price * (1 + bonus)
+    let debt_value_usd = actual_debt * debt_price / 1_000_000_00;
+    let collateral_to_seize = debt_value_usd * self.LIQUIDATION_BONUS * 1_000_000_00 / collateral_price / 10000;
+    
+    // Verify collateral balance
+    let collateral_liquidity_index = self.liquidity_indices.get(collateral_token).unwrap_or(self.INDEX_BASE);
+    let collateral_deposits = self.deposits.get((collateral_token, user)).unwrap_or(0);
+    let collateral_balance = collateral_deposits * collateral_liquidity_index / self.INDEX_BASE;
+    verify collateral_to_seize <= collateral_balance, "INSUFFICIENT_COLLATERAL";
+    
+    // Transfer debt token from liquidator
+    Token::transfer_from(debt_token, msg.sender, Address::from(self), actual_debt);
+    
+    // Reduce user's debt
+    let principal_repaid = actual_debt * self.INDEX_BASE / borrow_index;
+    self.borrows.insert((debt_token, user), borrow_principal - principal_repaid);
+    
+    // Reduce user's collateral deposits
+    let shares_to_burn = collateral_to_seize * self.INDEX_BASE / collateral_liquidity_index;
+    self.deposits.insert((collateral_token, user), collateral_deposits - shares_to_burn);
+    
+    // Transfer collateral to liquidator
+    Token::transfer(collateral_token, msg.sender, collateral_to_seize);
+    
+    // Update reserves
+    let mut debt_reserve = self.reserves.get(debt_token).unwrap();
+    debt_reserve.total_borrows -= actual_debt;
+    self.reserves.insert(debt_token, debt_reserve);
+    
+    let mut coll_reserve = self.reserves.get(collateral_token).unwrap();
+    coll_reserve.total_liquidity -= collateral_to_seize;
+    self.reserves.insert(collateral_token, coll_reserve);
+    
+    emit Liquidation {
+        user,
+        liquidator: msg.sender,
+        collateral_token,
+        debt_token,
+        debt_covered: actual_debt,
+        collateral_seized: collateral_to_seize,
+    };
+}
+
+// --- Admin Functions ---
+
+#[gas_limit(5000)]
+fn configure_reserve(token: Address, config: ReserveConfigInput) {
+    verify_only_admin();
+    
+    let mut reserve = self.reserves.get(token).unwrap_or(Reserve {
+        token,
+        total_liquidity: 0,
+        total_borrows: 0,
+        borrow_rate: 0,
+        supply_rate: 0,
+        base_rate: config.base_rate,
+        slope1: config.slope1,
+        slope2: config.slope2,
+        optimal_utilization: config.optimal_utilization,
+        reserve_factor: config.reserve_factor,
+        borrow_cap: config.borrow_cap,
+        supply_cap: config.supply_cap,
+        ltv: config.ltv,
+        liquidation_threshold: config.liquidation_threshold,
+        is_active: true,
+        is_frozen: false,
+        is_borrowable: config.is_borrowable,
+    });
+    
+    reserve.ltv = config.ltv;
+    reserve.liquidation_threshold = config.liquidation_threshold;
+    reserve.borrow_cap = config.borrow_cap;
+    reserve.supply_cap = config.supply_cap;
+    reserve.reserve_factor = config.reserve_factor;
+    reserve.base_rate = config.base_rate;
+    reserve.slope1 = config.slope1;
+    reserve.slope2 = config.slope2;
+    reserve.optimal_utilization = config.optimal_utilization;
+    reserve.is_borrowable = config.is_borrowable;
+    
+    self.reserves.insert(token, reserve);
+    
+    emit ReserveConfigUpdated {
+        token,
+        ltv: config.ltv,
+        liquidation_threshold: config.liquidation_threshold,
+        borrow_cap: config.borrow_cap,
+        supply_cap: config.supply_cap,
+        reserve_factor: config.reserve_factor,
+    };
+}
+
+#[gas_limit(3000)]
+fn set_price(token: Address, price: u128) {
+    verify_only_oracle();
+    self.prices.insert(token, price);
+    emit PriceUpdated { token, price };
+}
+
+#[gas_limit(3000)]
+fn set_paused(paused: bool) {
+    verify_only_admin();
+    self.paused = paused;
+}
+
+#[gas_limit(3000)]
+fn set_oracle(new_oracle: Address) {
+    verify_only_admin();
+    self.price_oracle = new_oracle;
+}
+
+// --- View Functions ---
+
+fn get_reserve_data(token: Address) -> Reserve {
+    self.reserves.get(token).unwrap()
+}
+
+fn get_user_deposit(token: Address, user: Address) -> u128 {
+    let shares = self.deposits.get((token, user)).unwrap_or(0);
+    let liquidity_index = self.liquidity_indices.get(token).unwrap_or(self.INDEX_BASE);
+    shares * liquidity_index / self.INDEX_BASE
+}
+
+fn get_user_debt(token: Address, user: Address) -> u128 {
+    let principal = self.borrows.get((token, user)).unwrap_or(0);
+    let borrow_index = self.borrow_indices.get(token).unwrap_or(self.INDEX_BASE);
+    principal * borrow_index / self.INDEX_BASE
+}
+
+fn get_health_factor(user: Address) -> u128 {
+    let (hf, _, _, _) = get_user_health_factor(user);
+    hf
+}
+
+fn get_account_data(user: Address) -> UserAccountData {
+    let (hf, collateral, debt, liq_threshold) = get_user_health_factor(user);
+    let reserve = self.reserves.get(Address::zero()).unwrap_or(Reserve {
+        token: Address::zero(),
+        total_liquidity: 0,
+        total_borrows: 0,
+        borrow_rate: 0,
+        supply_rate: 0,
+        base_rate: 0,
+        slope1: 0,
+        slope2: 0,
+        optimal_utilization: 0,
+        reserve_factor: 0,
+        borrow_cap: 0,
+        supply_cap: 0,
+        ltv: 0,
+        liquidation_threshold: 0,
+        is_active: false,
+        is_frozen: false,
+        is_borrowable: false,
+    });
+    
+    UserAccountData {
+        total_collateral_usd: collateral,
+        total_debt_usd: debt,
+        available_borrows_usd: if hf > self.HF_THRESHOLD { collateral - debt } else { 0 },
+        health_factor: hf,
+        liquidation_threshold: liq_threshold,
+    }
+}

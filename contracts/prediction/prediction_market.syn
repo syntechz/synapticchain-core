@@ -1,0 +1,498 @@
+// SynapticChain Prediction Market — Binary Outcome with VRF Resolution
+// Version: 1.0 | Compile-target: SynapticLang v2
+
+#[state]
+struct PredictionMarket {
+    // --- Core storage ---
+    markets: Map<u64, Market>,                     // market_id -> market state
+    positions: Map<(u64, Address), Position>,       // (market_id, user) -> shares
+    next_market_id: u64,
+    
+    // --- VRF ---
+    vrf_pending: Map<u64, u64>,                   // market_id -> request_id
+    vrf_requests: Map<u64, VrfRequest>,           // request_id -> VRF state
+    next_vrf_id: u64,
+    vrf_oracle: Address,
+    
+    // --- Admin ---
+    admin: Address,
+    paused: bool,
+    
+    // --- Constants ---
+    const MAX_FEE_BPS: u16 = 1000,               // 10% max fee
+    const MIN_BET: u128 = 1_000_000,             // 0.001 token min
+    const MAX_BET: u128 = 1_000_000_000_000_000, // 1M token max
+    const MAX_MARKETS: u64 = 10000,
+    const QUESTION_MAX_LEN: u16 = 256,
+    const URI_MAX_LEN: u16 = 256,
+}
+
+// --- Data Structures ---
+
+struct Market {
+    question: String,
+    creator: Address,
+    end_time: u64,
+    outcome_yes_pool: u128,
+    outcome_no_pool: u128,
+    total_shares: u128,
+    resolved: bool,
+    outcome: Option<bool>,       // None = unresolved, Some(true) = YES, Some(false) = NO
+    vrf_request_id: Option<u64>,
+    fee_bps: u16,
+    min_bet: u128,
+    max_bet: u128,
+    total_paid_out: u128,
+}
+
+struct Position {
+    yes_shares: u128,
+    no_shares: u128,
+    total_paid: u128,
+    claimed: bool,
+}
+
+struct VrfRequest {
+    market_id: u64,
+    request_time: u64,
+    fulfilled: bool,
+    randomness: u128,
+}
+
+// --- Events ---
+
+event MarketCreated {
+    market_id: u64,
+    question: String,
+    creator: Address,
+    end_time: u64,
+    fee_bps: u16,
+}
+
+event SharesPurchased {
+    market_id: u64,
+    user: Address,
+    outcome: bool,
+    amount: u128,
+    shares: u128,
+}
+
+event SharesSold {
+    market_id: u64,
+    user: Address,
+    outcome: bool,
+    shares: u128,
+    amount: u128,
+}
+
+event ResolutionRequested {
+    market_id: u64,
+    vrf_request_id: u64,
+}
+
+event MarketResolved {
+    market_id: u64,
+    outcome: bool,
+    vrf_request_id: u64,
+}
+
+event PayoutClaimed {
+    market_id: u64,
+    user: Address,
+    payout: u128,
+    fee: u128,
+}
+
+// --- Access Control ---
+
+fn verify_not_paused() {
+    verify !self.paused, "PAUSED";
+}
+
+fn verify_only_admin() {
+    verify msg.sender == self.admin, "UNAUTHORIZED";
+}
+
+fn verify_only_vrf() {
+    verify msg.sender == self.vrf_oracle, "UNAUTHORIZED_VRF";
+}
+
+// --- Market Helpers ---
+
+fn calculate_shares(market: &Market, outcome: bool, amount: u128) -> u128 {
+    let pool = if outcome { market.outcome_yes_pool } else { market.outcome_no_pool };
+    let total = market.total_shares;
+    
+    if total == 0 || pool == 0 {
+        amount  // 1:1 for first shares
+    } else {
+        amount * total / pool
+    }
+}
+
+fn calculate_sell_amount(market: &Market, outcome: bool, shares: u128) -> u128 {
+    let pool = if outcome { market.outcome_yes_pool } else { market.outcome_no_pool };
+    let total = market.total_shares;
+    
+    verify total > 0, "NO_SHARES";
+    shares * pool / total
+}
+
+// --- Entry Functions ---
+
+#[gas_limit(5000)]
+fn create_market(question: String, end_time: u64, fee_bps: u16, min_bet: u128, max_bet: u128) -> u64 {
+    verify_not_paused();
+    verify question.len() <= self.QUESTION_MAX_LEN as usize, "QUESTION_TOO_LONG";
+    verify end_time > block.timestamp, "END_TIME_IN_PAST";
+    verify fee_bps <= self.MAX_FEE_BPS, "FEE_TOO_HIGH";
+    verify min_bet >= self.MIN_BET, "MIN_BET_TOO_LOW";
+    verify max_bet <= self.MAX_BET, "MAX_BET_TOO_HIGH";
+    verify min_bet < max_bet, "INVALID_BET_RANGE";
+    verify self.next_market_id < self.MAX_MARKETS, "MAX_MARKETS_REACHED";
+    
+    let market_id = self.next_market_id;
+    self.next_market_id = market_id + 1;
+    
+    let market = Market {
+        question: question.clone(),
+        creator: msg.sender,
+        end_time,
+        outcome_yes_pool: 0,
+        outcome_no_pool: 0,
+        total_shares: 0,
+        resolved: false,
+        outcome: None,
+        vrf_request_id: None,
+        fee_bps,
+        min_bet,
+        max_bet,
+        total_paid_out: 0,
+    };
+    
+    self.markets.insert(market_id, market);
+    
+    emit MarketCreated {
+        market_id,
+        question,
+        creator: msg.sender,
+        end_time,
+        fee_bps,
+    };
+    
+    market_id
+}
+
+#[gas_limit(6000)]
+fn buy_shares(market_id: u64, outcome: bool, amount: u128) {
+    verify_not_paused();
+    let market = self.markets.get(market_id).unwrap();
+    verify !market.resolved, "MARKET_RESOLVED";
+    verify block.timestamp < market.end_time, "MARKET_EXPIRED";
+    verify amount >= market.min_bet && amount <= market.max_bet, "AMOUNT_OUT_OF_RANGE";
+    
+    let shares = calculate_shares(&market, outcome, amount);
+    verify shares > 0, "INVALID_SHARES";
+    
+    // Transfer payment to contract
+    Token::transfer_from(Address::from(self), msg.sender, Address::from(self), amount);
+    
+    // Update market pools
+    let mut market = self.markets.get_mut(market_id).unwrap();
+    if outcome {
+        market.outcome_yes_pool += amount;
+    } else {
+        market.outcome_no_pool += amount;
+    }
+    market.total_shares += shares;
+    
+    // Update position
+    let key = (market_id, msg.sender);
+    let mut position = self.positions.get(key).unwrap_or(Position {
+        yes_shares: 0,
+        no_shares: 0,
+        total_paid: 0,
+        claimed: false,
+    });
+    
+    if outcome {
+        position.yes_shares += shares;
+    } else {
+        position.no_shares += shares;
+    }
+    position.total_paid += amount;
+    
+    self.positions.insert(key, position);
+    
+    emit SharesPurchased {
+        market_id,
+        user: msg.sender,
+        outcome,
+        amount,
+        shares,
+    };
+}
+
+#[gas_limit(6000)]
+fn sell_shares(market_id: u64, outcome: bool, shares: u128) {
+    verify_not_paused();
+    let market = self.markets.get(market_id).unwrap();
+    verify !market.resolved, "MARKET_RESOLVED";
+    verify block.timestamp < market.end_time, "MARKET_EXPIRED";
+    
+    let key = (market_id, msg.sender);
+    let mut position = self.positions.get(key).unwrap();
+    
+    let current_shares = if outcome { position.yes_shares } else { position.no_shares };
+    verify current_shares >= shares, "INSUFFICIENT_SHARES";
+    
+    let amount = calculate_sell_amount(&market, outcome, shares);
+    verify amount > 0, "INVALID_AMOUNT";
+    
+    // Update position
+    if outcome {
+        position.yes_shares -= shares;
+    } else {
+        position.no_shares -= shares;
+    }
+    
+    // Update market
+    let mut market = self.markets.get_mut(market_id).unwrap();
+    if outcome {
+        market.outcome_yes_pool -= amount;
+    } else {
+        market.outcome_no_pool -= amount;
+    }
+    market.total_shares -= shares;
+    
+    self.positions.insert(key, position);
+    
+    // Transfer back to seller
+    Token::transfer(Address::from(self), msg.sender, amount);
+    
+    emit SharesSold {
+        market_id,
+        user: msg.sender,
+        outcome,
+        shares,
+        amount,
+    };
+}
+
+#[gas_limit(4000)]
+fn request_resolution(market_id: u64) {
+    let market = self.markets.get(market_id).unwrap();
+    verify !market.resolved, "ALREADY_RESOLVED";
+    verify block.timestamp >= market.end_time, "MARKET_NOT_EXPIRED";
+    verify market.vrf_request_id.is_none(), "VRF_ALREADY_REQUESTED";
+    
+    let request_id = self.next_vrf_id;
+    self.next_vrf_id = request_id + 1;
+    
+    let request = VrfRequest {
+        market_id,
+        request_time: block.timestamp,
+        fulfilled: false,
+        randomness: 0,
+    };
+    
+    self.vrf_requests.insert(request_id, request);
+    self.vrf_pending.insert(market_id, request_id);
+    
+    let mut market = self.markets.get_mut(market_id).unwrap();
+    market.vrf_request_id = Some(request_id);
+    
+    emit ResolutionRequested { market_id, vrf_request_id: request_id };
+}
+
+#[gas_limit(8000)]
+fn resolve_market(market_id: u64, vrf_proof: VrfProof) {
+    verify_only_vrf();
+    
+    let market = self.markets.get(market_id).unwrap();
+    verify !market.resolved, "ALREADY_RESOLVED";
+    verify block.timestamp >= market.end_time, "MARKET_NOT_EXPIRED";
+    
+    let request_id = market.vrf_request_id.unwrap_or(0);
+    verify request_id > 0, "NO_VRF_REQUEST";
+    
+    let mut request = self.vrf_requests.get(request_id).unwrap();
+    verify !request.fulfilled, "VRF_ALREADY_FULFILLED";
+    
+    // Verify VRF proof (simplified — actual verification depends on VRF scheme)
+    let is_valid = verify_vrf_proof(vrf_proof, request_id);
+    verify is_valid, "INVALID_VRF_PROOF";
+    
+    // Derive outcome from randomness
+    let randomness = vrf_proof.output;
+    let outcome = randomness % 2 == 0;
+    
+    request.fulfilled = true;
+    request.randomness = randomness;
+    self.vrf_requests.insert(request_id, request);
+    
+    let mut market = self.markets.get_mut(market_id).unwrap();
+    market.resolved = true;
+    market.outcome = Some(outcome);
+    
+    emit MarketResolved {
+        market_id,
+        outcome,
+        vrf_request_id: request_id,
+    };
+}
+
+#[gas_limit(5000)]
+fn claim_payout(market_id: u64) {
+    let market = self.markets.get(market_id).unwrap();
+    verify market.resolved, "NOT_RESOLVED";
+    let outcome = market.outcome.unwrap();
+    
+    let key = (market_id, msg.sender);
+    let mut position = self.positions.get(key).unwrap();
+    verify !position.claimed, "ALREADY_CLAIMED";
+    
+    let winning_shares: u128;
+    let winning_pool: u128;
+    let total_winning_shares: u128;
+    
+    if outcome {
+        winning_shares = position.yes_shares;
+        winning_pool = market.outcome_yes_pool;
+        // In this model, total shares for YES = outcome_yes_pool (simplified)
+        total_winning_shares = market.total_shares * market.outcome_yes_pool / (market.outcome_yes_pool + market.outcome_no_pool);
+    } else {
+        winning_shares = position.no_shares;
+        winning_pool = market.outcome_no_pool;
+        total_winning_shares = market.total_shares * market.outcome_no_pool / (market.outcome_yes_pool + market.outcome_no_pool);
+    }
+    
+    verify winning_shares > 0, "NO_WINNING_SHARES";
+    
+    let total_pool = market.outcome_yes_pool + market.outcome_no_pool;
+    let payout = winning_shares * total_pool / total_winning_shares;
+    let fee = payout * market.fee_bps as u128 / 10000;
+    let payout_after_fee = payout - fee;
+    
+    position.claimed = true;
+    self.positions.insert(key, position);
+    
+    // Update market
+    let mut market = self.markets.get_mut(market_id).unwrap();
+    market.total_paid_out += payout_after_fee;
+    
+    // Transfer payout
+    Token::transfer(Address::from(self), msg.sender, payout_after_fee);
+    
+    emit PayoutClaimed {
+        market_id,
+        user: msg.sender,
+        payout: payout_after_fee,
+        fee,
+    };
+}
+
+// --- VRF Helpers ---
+
+fn verify_vrf_proof(proof: VrfProof, request_id: u64) -> bool {
+    // Placeholder for actual VRF verification
+    // In production: Ed25519 signature verification on VRF output
+    proof.request_id == request_id && proof.output > 0
+}
+
+struct VrfProof {
+    request_id: u64,
+    output: u128,
+    gamma: Vec<u8>,
+    c: Vec<u8>,
+    s: Vec<u8>,
+}
+
+// --- Admin Functions ---
+
+#[gas_limit(3000)]
+fn set_paused(paused: bool) {
+    verify_only_admin();
+    self.paused = paused;
+}
+
+#[gas_limit(3000)]
+fn set_vrf_oracle(new_oracle: Address) {
+    verify_only_admin();
+    self.vrf_oracle = new_oracle;
+}
+
+#[gas_limit(3000)]
+fn emergency_resolve(market_id: u64, outcome: bool) {
+    verify_only_admin();
+    let market = self.markets.get(market_id).unwrap();
+    verify !market.resolved, "ALREADY_RESOLVED";
+    
+    let mut market = self.markets.get_mut(market_id).unwrap();
+    market.resolved = true;
+    market.outcome = Some(outcome);
+    
+    emit MarketResolved {
+        market_id,
+        outcome,
+        vrf_request_id: 0,
+    };
+}
+
+// --- View Functions ---
+
+fn get_market(market_id: u64) -> Market {
+    self.markets.get(market_id).unwrap()
+}
+
+fn get_position(market_id: u64, user: Address) -> Position {
+    self.positions.get((market_id, user)).unwrap_or(Position {
+        yes_shares: 0,
+        no_shares: 0,
+        total_paid: 0,
+        claimed: false,
+    })
+}
+
+fn get_expected_payout(market_id: u64, user: Address) -> u128 {
+    let market = self.markets.get(market_id).unwrap();
+    if !market.resolved {
+        return 0;
+    }
+    
+    let outcome = market.outcome.unwrap();
+    let position = self.positions.get((market_id, user)).unwrap_or(Position {
+        yes_shares: 0,
+        no_shares: 0,
+        total_paid: 0,
+        claimed: false,
+    });
+    
+    if position.claimed {
+        return 0;
+    }
+    
+    let winning_shares = if outcome { position.yes_shares } else { position.no_shares };
+    if winning_shares == 0 {
+        return 0;
+    }
+    
+    let total_pool = market.outcome_yes_pool + market.outcome_no_pool;
+    let total_winning_shares = if outcome {
+        market.total_shares * market.outcome_yes_pool / total_pool
+    } else {
+        market.total_shares * market.outcome_no_pool / total_pool
+    };
+    
+    let payout = winning_shares * total_pool / total_winning_shares;
+    payout * (10000 - market.fee_bps as u128) / 10000
+}
+
+fn get_implied_probability(market_id: u64) -> u128 {
+    let market = self.markets.get(market_id).unwrap();
+    let total = market.outcome_yes_pool + market.outcome_no_pool;
+    if total == 0 {
+        return 5000; // 50% default
+    }
+    market.outcome_yes_pool * 10000 / total
+}

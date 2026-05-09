@@ -1,0 +1,562 @@
+// SynapticChain Perpetuals DEX — Funding Rate + Leverage Trading
+// Version: 1.0 | Compile-target: SynapticLang v2
+
+#[state]
+struct PerpetualsDEX {
+    // --- Core storage ---
+    positions: Map<(Address, u64), Position>,       // (trader, market_id) -> position
+    markets: Map<u64, Market>,                      // market_id -> market config + OI
+    global_pool: Pool,                                // single collateral pool
+    
+    // --- Oracle ---
+    oracle_prices: Map<u64, u128>,                   // market_id -> latest price
+    price_oracle: Address,
+    last_price_update: Map<u64, u64>,                // market_id -> timestamp
+    
+    // --- Funding ---
+    funding_rates: Map<u64, i128>,                    // market_id -> current rate
+    last_funding_update: Map<u64, u64>,               // market_id -> last update
+    cumulative_funding: Map<(u64, bool), i128>,      // (market_id, is_long) -> cumulative
+    
+    // --- Admin ---
+    admin: Address,
+    paused: bool,
+    
+    // --- Constants ---
+    const MAX_LEVERAGE: u16 = 5000,                   // 50x = 5000/100
+    const MIN_LEVERAGE: u16 = 100,                    // 1x minimum
+    const LIQUIDATION_THRESHOLD: u128 = 100,            // 1% margin ratio
+    const LIQUIDATION_FEE_BPS: u16 = 100,             // 1% fee
+    const MAX_PRICE_AGE: u64 = 300,                    // 5 minutes
+    const FUNDING_INTERVAL: u64 = 28800,               // 8 hours
+    const FUNDING_FACTOR: u128 = 1_000_000_000_000_000, // scaling factor
+}
+
+// --- Data Structures ---
+
+struct Position {
+    size: u128,               // position size in USD (notional)
+    collateral: u128,         // collateral deposited
+    entry_price: u128,        // average entry price
+    is_long: bool,
+    last_funding_time: u64,
+    funding_paid: i128,       // accumulated funding payments (negative = received)
+    open_interest: u128,      // size at open (for OI tracking)
+}
+
+struct Market {
+    index_token: Address,     // e.g. BTC, ETH
+    max_leverage: u16,        // e.g. 5000 = 50x
+    min_collateral: u128,
+    max_position_size: u128,  // max per-trader
+    max_open_interest: u128,  // global OI cap
+    open_interest_long: u128,
+    open_interest_short: u128,
+    funding_interval: u64,
+    is_active: bool,
+}
+
+struct MarketConfigInput {
+    index_token: Address,
+    max_leverage: u16,
+    min_collateral: u128,
+    max_position_size: u128,
+    max_open_interest: u128,
+    funding_interval: u64,
+}
+
+struct Pool {
+    total_collateral: u128,
+    total_pnl: i128,          // accumulated trader PnL (negative = profit)
+    total_fees: u128,         // accumulated protocol fees
+}
+
+// --- Events ---
+
+event PositionOpened {
+    trader: Address,
+    market: u64,
+    size: u128,
+    collateral: u128,
+    is_long: bool,
+    entry_price: u128,
+}
+
+event PositionClosed {
+    trader: Address,
+    market: u64,
+    size_closed: u128,
+    pnl: i128,
+    collateral_returned: u128,
+    fee: u128,
+}
+
+event PositionLiquidated {
+    trader: Address,
+    market: u64,
+    liquidator: Address,
+    size: u128,
+    collateral: u128,
+    pnl: i128,
+    fee: u128,
+}
+
+event CollateralAdded {
+    trader: Address,
+    market: u64,
+    amount: u128,
+}
+
+event FundingRateUpdated {
+    market: u64,
+    rate: i128,
+    long_oi: u128,
+    short_oi: u128,
+}
+
+event PriceUpdated {
+    market: u64,
+    price: u128,
+    timestamp: u64,
+}
+
+// --- Access Control ---
+
+fn verify_not_paused() {
+    verify !self.paused, "PAUSED";
+}
+
+fn verify_only_admin() {
+    verify msg.sender == self.admin, "UNAUTHORIZED";
+}
+
+fn verify_only_oracle() {
+    verify msg.sender == self.price_oracle, "UNAUTHORIZED_ORACLE";
+}
+
+fn verify_valid_price(market_id: u64) {
+    let last_update = self.last_price_update.get(market_id).unwrap_or(0);
+    verify block.timestamp - last_update <= self.MAX_PRICE_AGE, "STALE_PRICE";
+}
+
+// --- Math Helpers ---
+
+fn calculate_pnl(position: &Position, current_price: u128) -> i128 {
+    let price_diff: i128;
+    if position.is_long {
+        price_diff = (current_price as i128) - (position.entry_price as i128);
+    } else {
+        price_diff = (position.entry_price as i128) - (current_price as i128);
+    }
+    
+    let pnl = price_diff * position.size as i128 / position.entry_price as i128;
+    pnl
+}
+
+fn calculate_funding(position: &Position, funding_rate: i128, elapsed: u64) -> i128 {
+    if elapsed == 0 {
+        return 0;
+    }
+    
+    let periods = elapsed as i128 / self.FUNDING_INTERVAL as i128;
+    if periods == 0 {
+        return 0;
+    }
+    
+    let funding = funding_rate * position.size as i128 * periods / self.FUNDING_FACTOR as i128;
+    
+    if position.is_long {
+        funding  // longs pay when rate > 0
+    } else {
+        -funding  // shorts receive when rate > 0
+    }
+}
+
+fn margin_ratio(position: &Position, pnl: i128) -> u128 {
+    let total_value = position.collateral as i128 + pnl;
+    if total_value <= 0 || position.size == 0 {
+        return 0;
+    }
+    (total_value as u128) * 10000 / position.size
+}
+
+// --- Entry Functions ---
+
+#[gas_limit(10000)]
+fn open_position(market_id: u64, collateral: u128, size: u128, is_long: bool) {
+    verify_not_paused();
+    let market = self.markets.get(market_id).unwrap();
+    verify market.is_active, "MARKET_NOT_ACTIVE";
+    verify collateral >= market.min_collateral, "INSUFFICIENT_COLLATERAL";
+    verify size > 0, "INVALID_SIZE";
+    
+    let leverage = size * 100 / collateral;
+    verify leverage <= market.max_leverage as u128, "MAX_LEVERAGE_EXCEEDED";
+    verify leverage >= self.MIN_LEVERAGE as u128, "MIN_LEVERAGE_NOT_MET";
+    verify size <= market.max_position_size, "MAX_POSITION_SIZE";
+    
+    // Check OI cap
+    if is_long {
+        verify market.open_interest_long + size <= market.max_open_interest, "MAX_OI_REACHED";
+    } else {
+        verify market.open_interest_short + size <= market.max_open_interest, "MAX_OI_REACHED";
+    }
+    
+    let price = self.oracle_prices.get(market_id).unwrap_or(0);
+    verify price > 0, "NO_PRICE";
+    verify_valid_price(market_id);
+    
+    // Transfer collateral to pool
+    Token::transfer_from(Address::from(self.global_pool), msg.sender, Address::from(self), collateral);
+    
+    let mut global_pool = self.global_pool;
+    global_pool.total_collateral += collateral;
+    self.global_pool = global_pool;
+    
+    // Update market OI
+    let mut market = self.markets.get_mut(market_id).unwrap();
+    if is_long {
+        market.open_interest_long += size;
+    } else {
+        market.open_interest_short += size;
+    }
+    
+    // Check if position exists (adding to existing)
+    let key = (msg.sender, market_id);
+    let existing = self.positions.get(key);
+    
+    if existing.is_some() {
+        let mut pos = existing.unwrap();
+        // Update entry price (weighted average)
+        let total_size = pos.size + size;
+        pos.entry_price = (pos.entry_price * pos.size + price * size) / total_size;
+        pos.size = total_size;
+        pos.collateral += collateral;
+        
+        // Accrue funding before modifying
+        let funding_rate = self.funding_rates.get(market_id).unwrap_or(0);
+        let elapsed = block.timestamp - pos.last_funding_time;
+        let funding = calculate_funding(&pos, funding_rate, elapsed);
+        pos.funding_paid += funding;
+        pos.last_funding_time = block.timestamp;
+        
+        self.positions.insert(key, pos);
+    } else {
+        let position = Position {
+            size,
+            collateral,
+            entry_price: price,
+            is_long,
+            last_funding_time: block.timestamp,
+            funding_paid: 0,
+            open_interest: size,
+        };
+        self.positions.insert(key, position);
+    }
+    
+    emit PositionOpened {
+        trader: msg.sender,
+        market: market_id,
+        size,
+        collateral,
+        is_long,
+        entry_price: price,
+    };
+}
+
+#[gas_limit(10000)]
+fn close_position(market_id: u64, size_to_close: u128) {
+    verify_not_paused();
+    let key = (msg.sender, market_id);
+    let mut position = self.positions.get(key).unwrap();
+    verify size_to_close > 0 && size_to_close <= position.size, "INVALID_CLOSE_SIZE";
+    
+    let price = self.oracle_prices.get(market_id).unwrap_or(0);
+    verify price > 0, "NO_PRICE";
+    verify_valid_price(market_id);
+    
+    // Calculate PnL
+    let pnl = calculate_pnl(&position, price);
+    let close_ratio = size_to_close * self.FUNDING_FACTOR / position.size;
+    let realized_pnl = pnl * close_ratio as i128 / self.FUNDING_FACTOR as i128;
+    
+    // Calculate funding
+    let funding_rate = self.funding_rates.get(market_id).unwrap_or(0);
+    let elapsed = block.timestamp - position.last_funding_time;
+    let funding = calculate_funding(&position, funding_rate, elapsed);
+    let realized_funding = funding * close_ratio as i128 / self.FUNDING_FACTOR as i128;
+    
+    // Collateral to return
+    let collateral_returned = position.collateral * close_ratio / self.FUNDING_FACTOR;
+    let total_return = collateral_returned as i128 + realized_pnl - realized_funding;
+    
+    verify total_return >= 0, "NEGATIVE_RETURN";
+    
+    // Update global pool
+    let mut global_pool = self.global_pool;
+    global_pool.total_collateral -= collateral_returned;
+    global_pool.total_pnl += realized_pnl;
+    global_pool.total_fees += 0; // protocol fee could be added here
+    self.global_pool = global_pool;
+    
+    // Update market OI
+    let mut market = self.markets.get_mut(market_id).unwrap();
+    if position.is_long {
+        market.open_interest_long -= size_to_close;
+    } else {
+        market.open_interest_short -= size_to_close;
+    }
+    
+    // Update or remove position
+    if size_to_close == position.size {
+        self.positions.remove(key);
+    } else {
+        position.size -= size_to_close;
+        position.collateral -= collateral_returned;
+        position.funding_paid += realized_funding;
+        position.last_funding_time = block.timestamp;
+        self.positions.insert(key, position);
+    }
+    
+    // Transfer collateral + PnL to trader
+    Token::transfer(Address::from(self.global_pool), msg.sender, total_return as u128);
+    
+    emit PositionClosed {
+        trader: msg.sender,
+        market: market_id,
+        size_closed: size_to_close,
+        pnl: realized_pnl,
+        collateral_returned: total_return as u128,
+        fee: 0,
+    };
+}
+
+#[gas_limit(4000)]
+fn add_collateral(market_id: u64, additional: u128) {
+    verify_not_paused();
+    let key = (msg.sender, market_id);
+    let mut position = self.positions.get(key).unwrap();
+    
+    // Transfer additional collateral
+    Token::transfer_from(Address::from(self.global_pool), msg.sender, Address::from(self), additional);
+    
+    let mut global_pool = self.global_pool;
+    global_pool.total_collateral += additional;
+    self.global_pool = global_pool;
+    
+    position.collateral += additional;
+    self.positions.insert(key, position);
+    
+    emit CollateralAdded {
+        trader: msg.sender,
+        market: market_id,
+        amount: additional,
+    };
+}
+
+#[gas_limit(8000)]
+fn liquidate(trader: Address, market_id: u64) {
+    verify_not_paused();
+    verify trader != msg.sender, "SELF_LIQUIDATION";
+    
+    let key = (trader, market_id);
+    let position = self.positions.get(key).unwrap();
+    
+    let price = self.oracle_prices.get(market_id).unwrap_or(0);
+    verify price > 0, "NO_PRICE";
+    verify_valid_price(market_id);
+    
+    // Calculate PnL and margin ratio
+    let pnl = calculate_pnl(&position, price);
+    let mr = margin_ratio(&position, pnl);
+    
+    verify mr < self.LIQUIDATION_THRESHOLD as u128 * 100, "POSITION_NOT_LIQUIDATABLE";
+    
+    // Calculate funding
+    let funding_rate = self.funding_rates.get(market_id).unwrap_or(0);
+    let elapsed = block.timestamp - position.last_funding_time;
+    let funding = calculate_funding(&position, funding_rate, elapsed);
+    
+    // Liquidation fee
+    let fee = position.size * self.LIQUIDATION_FEE_BPS as u128 / 10000;
+    let total_pnl = pnl - funding;
+    let remaining = position.collateral as i128 + total_pnl - fee as i128;
+    
+    // Update global pool
+    let mut global_pool = self.global_pool;
+    global_pool.total_collateral -= position.collateral;
+    global_pool.total_pnl += total_pnl;
+    global_pool.total_fees += fee;
+    self.global_pool = global_pool;
+    
+    // Update market OI
+    let mut market = self.markets.get_mut(market_id).unwrap();
+    if position.is_long {
+        market.open_interest_long -= position.size;
+    } else {
+        market.open_interest_short -= position.size;
+    }
+    
+    // Remove position
+    self.positions.remove(key);
+    
+    // Pay liquidator fee
+    if fee > 0 {
+        Token::transfer(Address::from(self.global_pool), msg.sender, fee);
+    }
+    
+    // Return remaining collateral to trader (if any)
+    if remaining > 0 {
+        Token::transfer(Address::from(self.global_pool), trader, remaining as u128);
+    } else if remaining < 0 {
+        // Loss socialized to pool (already reflected in total_pnl)
+        // No additional action needed
+    }
+    
+    emit PositionLiquidated {
+        trader,
+        market: market_id,
+        liquidator: msg.sender,
+        size: position.size,
+        collateral: position.collateral,
+        pnl: total_pnl,
+        fee,
+    };
+}
+
+#[gas_limit(3000)]
+fn update_funding_rate(market_id: u64) {
+    let market = self.markets.get(market_id).unwrap();
+    verify market.is_active, "MARKET_NOT_ACTIVE";
+    
+    let pool_size = self.global_pool.total_collateral;
+    verify pool_size > 0, "NO_POOL_COLLATERAL";
+    
+    let oi_diff = if market.open_interest_long > market.open_interest_short {
+        market.open_interest_long - market.open_interest_short
+    } else {
+        market.open_interest_short - market.open_interest_long
+    };
+    
+    let rate = (oi_diff as i128) * (self.FUNDING_FACTOR as i128) / (pool_size as i128);
+    
+    // Sign based on which side has more OI
+    let signed_rate: i128;
+    if market.open_interest_long > market.open_interest_short {
+        signed_rate = rate; // longs pay shorts
+    } else {
+        signed_rate = -rate; // shorts pay longs
+    }
+    
+    self.funding_rates.insert(market_id, signed_rate);
+    self.last_funding_update.insert(market_id, block.timestamp);
+    
+    emit FundingRateUpdated {
+        market: market_id,
+        rate: signed_rate,
+        long_oi: market.open_interest_long,
+        short_oi: market.open_interest_short,
+    };
+}
+
+// --- Oracle & Admin Functions ---
+
+#[gas_limit(3000)]
+fn update_price(market_id: u64, price: u128) {
+    verify_only_oracle();
+    verify price > 0, "INVALID_PRICE";
+    
+    self.oracle_prices.insert(market_id, price);
+    self.last_price_update.insert(market_id, block.timestamp);
+    
+    emit PriceUpdated {
+        market: market_id,
+        price,
+        timestamp: block.timestamp,
+    };
+}
+
+#[gas_limit(5000)]
+fn create_market(config: MarketConfigInput) -> u64 {
+    verify_only_admin();
+    verify config.max_leverage <= self.MAX_LEVERAGE, "MAX_LEVERAGE_TOO_HIGH";
+    verify config.max_leverage >= self.MIN_LEVERAGE, "MIN_LEVERAGE_TOO_LOW";
+    verify config.max_open_interest > 0, "INVALID_OI_CAP";
+    
+    // Find next market ID (simplified - in production use counter)
+    let mut market_id = 0;
+    while self.markets.contains(market_id) {
+        market_id += 1;
+        verify market_id < 10000, "MAX_MARKETS";
+    }
+    
+    let market = Market {
+        index_token: config.index_token,
+        max_leverage: config.max_leverage,
+        min_collateral: config.min_collateral,
+        max_position_size: config.max_position_size,
+        max_open_interest: config.max_open_interest,
+        open_interest_long: 0,
+        open_interest_short: 0,
+        funding_interval: config.funding_interval,
+        is_active: true,
+    };
+    
+    self.markets.insert(market_id, market);
+    market_id
+}
+
+#[gas_limit(3000)]
+fn set_paused(paused: bool) {
+    verify_only_admin();
+    self.paused = paused;
+}
+
+#[gas_limit(3000)]
+fn set_oracle(new_oracle: Address) {
+    verify_only_admin();
+    self.price_oracle = new_oracle;
+}
+
+// --- View Functions ---
+
+fn get_position(trader: Address, market_id: u64) -> Position {
+    self.positions.get((trader, market_id)).unwrap_or(Position {
+        size: 0,
+        collateral: 0,
+        entry_price: 0,
+        is_long: false,
+        last_funding_time: 0,
+        funding_paid: 0,
+        open_interest: 0,
+    })
+}
+
+fn get_market(market_id: u64) -> Market {
+    self.markets.get(market_id).unwrap()
+}
+
+fn get_margin_ratio(trader: Address, market_id: u64) -> u128 {
+    let position = self.positions.get((trader, market_id));
+    if position.is_none() {
+        return u128::MAX;
+    }
+    let pos = position.unwrap();
+    let price = self.oracle_prices.get(market_id).unwrap_or(0);
+    let pnl = calculate_pnl(&pos, price);
+    margin_ratio(&pos, pnl)
+}
+
+fn get_unrealized_pnl(trader: Address, market_id: u64) -> i128 {
+    let position = self.positions.get((trader, market_id));
+    if position.is_none() {
+        return 0;
+    }
+    let pos = position.unwrap();
+    let price = self.oracle_prices.get(market_id).unwrap_or(0);
+    calculate_pnl(&pos, price)
+}
+
+fn get_funding_rate(market_id: u64) -> i128 {
+    self.funding_rates.get(market_id).unwrap_or(0)
+}

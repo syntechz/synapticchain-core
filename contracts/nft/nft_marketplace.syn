@@ -1,0 +1,535 @@
+// SynapticChain NFT Marketplace — Minting, Fixed-Price Listing, Royalty Enforcement
+// Version: 1.0 | Compile-target: SynapticLang v2
+
+#[state]
+struct NFTMarketplace {
+    // --- Core storage ---
+    collections: Map<u64, Collection>,              // collection_id -> metadata
+    tokens: Map<(u64, u32), Token>,               // (collection_id, token_id) -> metadata
+    owners: Map<(u64, u32), Address>,             // (collection_id, token_id) -> owner
+    balances: Map<(u64, Address), u32>,           // (collection_id, user) -> token count
+    listings: Map<(u64, u32), Listing>,           // (collection_id, token_id) -> listing
+    royalties: Map<u64, RoyaltyConfig>,           // collection_id -> royalty settings
+    
+    // --- Counters ---
+    next_collection_id: u64,
+    
+    // --- Admin ---
+    admin: Address,
+    paused: bool,
+    
+    // --- Constants ---
+    const MAX_SUPPLY: u32 = 1_000_000,
+    const NAME_MAX_LEN: u16 = 64,
+    const SYMBOL_MAX_LEN: u16 = 8,
+    const URI_MAX_LEN: u16 = 256,
+    const BATCH_MINT_MAX: u8 = 20,
+    const BATCH_BUY_MAX: u8 = 10,
+    const MAX_ROYALTY_BPS: u16 = 10000,            // 100%
+}
+
+// --- Data Structures ---
+
+struct Collection {
+    creator: Address,
+    name: String,
+    symbol: String,
+    max_supply: u32,
+    minted: u32,
+    base_uri: String,
+    mint_price: u128,
+    is_mint_active: bool,
+}
+
+struct Token {
+    metadata_uri: String,
+    minted_at: u64,
+}
+
+struct Listing {
+    seller: Address,
+    price: u128,
+    created_at: u64,
+}
+
+struct RoyaltyConfig {
+    recipient: Address,
+    bps: u16,                                     // basis points (e.g. 250 = 2.5%)
+}
+
+struct CollectionInfo {
+    collection_id: u64,
+    creator: Address,
+    name: String,
+    symbol: String,
+    max_supply: u32,
+    minted: u32,
+    mint_price: u128,
+    is_mint_active: bool,
+    royalty_bps: u16,
+}
+
+// --- Events ---
+
+event CollectionCreated {
+    collection_id: u64,
+    creator: Address,
+    name: String,
+    symbol: String,
+    max_supply: u32,
+}
+
+event TokenMinted {
+    collection_id: u64,
+    token_id: u32,
+    owner: Address,
+    metadata_uri: String,
+}
+
+event TokenListed {
+    collection_id: u64,
+    token_id: u32,
+    seller: Address,
+    price: u128,
+}
+
+event TokenCancelled {
+    collection_id: u64,
+    token_id: u32,
+    seller: Address,
+}
+
+event TokenSold {
+    collection_id: u64,
+    token_id: u32,
+    seller: Address,
+    buyer: Address,
+    price: u128,
+    royalty: u128,
+}
+
+event TokenTransferred {
+    collection_id: u64,
+    token_id: u32,
+    from: Address,
+    to: Address,
+}
+
+// --- Access Control ---
+
+fn verify_not_paused() {
+    verify !self.paused, "PAUSED";
+}
+
+fn verify_only_admin() {
+    verify msg.sender == self.admin, "UNAUTHORIZED";
+}
+
+fn verify_token_owner(collection_id: u64, token_id: u32) {
+    let owner = self.owners.get((collection_id, token_id)).unwrap_or(Address::zero());
+    verify owner == msg.sender, "NOT_OWNER";
+}
+
+// --- Entry Functions ---
+
+#[gas_limit(5000)]
+fn create_collection(
+    name: String,
+    symbol: String,
+    max_supply: u32,
+    base_uri: String,
+    mint_price: u128,
+    royalty_bps: u16,
+    royalty_recipient: Address,
+) -> u64 {
+    verify_not_paused();
+    verify name.len() <= self.NAME_MAX_LEN as usize, "NAME_TOO_LONG";
+    verify symbol.len() <= self.SYMBOL_MAX_LEN as usize, "SYMBOL_TOO_LONG";
+    verify base_uri.len() <= self.URI_MAX_LEN as usize, "URI_TOO_LONG";
+    verify max_supply > 0 && max_supply <= self.MAX_SUPPLY, "INVALID_SUPPLY";
+    verify royalty_bps <= self.MAX_ROYALTY_BPS, "ROYALTY_TOO_HIGH";
+    verify royalty_recipient != Address::zero(), "INVALID_RECIPIENT";
+    
+    let collection_id = self.next_collection_id;
+    self.next_collection_id = collection_id + 1;
+    
+    let collection = Collection {
+        creator: msg.sender,
+        name: name.clone(),
+        symbol: symbol.clone(),
+        max_supply,
+        minted: 0,
+        base_uri,
+        mint_price,
+        is_mint_active: true,
+    };
+    
+    self.collections.insert(collection_id, collection);
+    
+    let royalty = RoyaltyConfig {
+        recipient: royalty_recipient,
+        bps: royalty_bps,
+    };
+    self.royalties.insert(collection_id, royalty);
+    
+    emit CollectionCreated {
+        collection_id,
+        creator: msg.sender,
+        name,
+        symbol,
+        max_supply,
+    };
+    
+    collection_id
+}
+
+#[gas_limit(6000)]
+fn mint(collection_id: u64, metadata_uri: String) {
+    verify_not_paused();
+    verify metadata_uri.len() <= self.URI_MAX_LEN as usize, "URI_TOO_LONG";
+    
+    let mut collection = self.collections.get(collection_id).unwrap();
+    verify collection.is_mint_active, "MINT_NOT_ACTIVE";
+    verify collection.minted < collection.max_supply, "MAX_SUPPLY_REACHED";
+    
+    // Pay mint price
+    if collection.mint_price > 0 {
+        Token::transfer_from(Address::from(self), msg.sender, Address::from(self), collection.mint_price);
+    }
+    
+    let token_id = collection.minted + 1;
+    collection.minted = token_id;
+    self.collections.insert(collection_id, collection);
+    
+    let token = Token {
+        metadata_uri: metadata_uri.clone(),
+        minted_at: block.timestamp,
+    };
+    self.tokens.insert((collection_id, token_id), token);
+    self.owners.insert((collection_id, token_id), msg.sender);
+    
+    let current_balance = self.balances.get((collection_id, msg.sender)).unwrap_or(0);
+    self.balances.insert((collection_id, msg.sender), current_balance + 1);
+    
+    emit TokenMinted {
+        collection_id,
+        token_id,
+        owner: msg.sender,
+        metadata_uri,
+    };
+}
+
+#[gas_limit(4000)]
+fn list_for_sale(collection_id: u64, token_id: u32, price: u128) {
+    verify_not_paused();
+    verify_token_owner(collection_id, token_id);
+    verify price > 0, "INVALID_PRICE";
+    
+    // Verify no existing listing
+    verify !self.listings.contains((collection_id, token_id)), "ALREADY_LISTED";
+    
+    let listing = Listing {
+        seller: msg.sender,
+        price,
+        created_at: block.timestamp,
+    };
+    self.listings.insert((collection_id, token_id), listing);
+    
+    emit TokenListed {
+        collection_id,
+        token_id,
+        seller: msg.sender,
+        price,
+    };
+}
+
+#[gas_limit(3000)]
+fn cancel_listing(collection_id: u64, token_id: u32) {
+    verify_not_paused();
+    let listing = self.listings.get((collection_id, token_id)).unwrap();
+    verify listing.seller == msg.sender, "NOT_SELLER";
+    
+    self.listings.remove((collection_id, token_id));
+    
+    emit TokenCancelled {
+        collection_id,
+        token_id,
+        seller: msg.sender,
+    };
+}
+
+#[gas_limit(8000)]
+fn buy(collection_id: u64, token_id: u32) {
+    verify_not_paused();
+    let listing = self.listings.get((collection_id, token_id)).unwrap();
+    let price = listing.price;
+    let seller = listing.seller;
+    
+    verify seller != msg.sender, "CANNOT_BUY_OWN";
+    
+    // Verify buyer sent enough (msg.value or token transfer)
+    // In this model, we use Token::transfer_from for payment token
+    // The payment token address would be configured per marketplace
+    let payment_token = Address::from(self); // placeholder — set actual payment token in production
+    Token::transfer_from(payment_token, msg.sender, Address::from(self), price);
+    
+    // Calculate royalty
+    let royalty_config = self.royalties.get(collection_id).unwrap_or(RoyaltyConfig {
+        recipient: Address::zero(),
+        bps: 0,
+    });
+    let royalty = price * royalty_config.bps as u128 / 10000;
+    let proceeds = price - royalty;
+    
+    // Transfer proceeds to seller
+    if proceeds > 0 {
+        Token::transfer(payment_token, seller, proceeds);
+    }
+    
+    // Transfer royalty to recipient
+    if royalty > 0 && royalty_config.recipient != Address::zero() {
+        Token::transfer(payment_token, royalty_config.recipient, royalty);
+    }
+    
+    // Transfer ownership
+    self.owners.insert((collection_id, token_id), msg.sender);
+    
+    // Update balances
+    let seller_balance = self.balances.get((collection_id, seller)).unwrap_or(0);
+    verify seller_balance > 0, "SELLER_NO_BALANCE";
+    self.balances.insert((collection_id, seller), seller_balance - 1);
+    
+    let buyer_balance = self.balances.get((collection_id, msg.sender)).unwrap_or(0);
+    self.balances.insert((collection_id, msg.sender), buyer_balance + 1);
+    
+    // Remove listing
+    self.listings.remove((collection_id, token_id));
+    
+    emit TokenSold {
+        collection_id,
+        token_id,
+        seller,
+        buyer: msg.sender,
+        price,
+        royalty,
+    };
+}
+
+#[gas_limit(4000)]
+fn transfer(collection_id: u64, token_id: u32, to: Address) {
+    verify_not_paused();
+    verify to != Address::zero(), "INVALID_RECIPIENT";
+    verify_token_owner(collection_id, token_id);
+    
+    // Remove listing if exists (auto-cancel on transfer)
+    if self.listings.contains((collection_id, token_id)) {
+        self.listings.remove((collection_id, token_id));
+    }
+    
+    // Update balances
+    let from_balance = self.balances.get((collection_id, msg.sender)).unwrap_or(0);
+    verify from_balance > 0, "NO_BALANCE";
+    self.balances.insert((collection_id, msg.sender), from_balance - 1);
+    
+    let to_balance = self.balances.get((collection_id, to)).unwrap_or(0);
+    self.balances.insert((collection_id, to), to_balance + 1);
+    
+    // Update owner
+    self.owners.insert((collection_id, token_id), to);
+    
+    emit TokenTransferred {
+        collection_id,
+        token_id,
+        from: msg.sender,
+        to,
+    };
+}
+
+// --- Batch Operations (Bounded) ---
+
+#[gas_limit(12000)]
+fn batch_mint(collection_id: u64, metadata_uris: Vec<String>) {
+    verify_not_paused();
+    verify metadata_uris.len() <= self.BATCH_MINT_MAX as usize, "BATCH_TOO_LARGE";
+    
+    let collection = self.collections.get(collection_id).unwrap();
+    verify collection.is_mint_active, "MINT_NOT_ACTIVE";
+    verify collection.minted + metadata_uris.len() as u32 <= collection.max_supply, "MAX_SUPPLY_REACHED";
+    
+    // Pay total mint price upfront
+    let total_price = collection.mint_price * metadata_uris.len() as u128;
+    if total_price > 0 {
+        Token::transfer_from(Address::from(self), msg.sender, Address::from(self), total_price);
+    }
+    
+    for i in 0..metadata_uris.len() {
+        if i >= self.BATCH_MINT_MAX as usize {
+            break;
+        }
+        let uri = metadata_uris[i].clone();
+        verify uri.len() <= self.URI_MAX_LEN as usize, "URI_TOO_LONG";
+        
+        // Call single mint logic
+        let mut collection = self.collections.get(collection_id).unwrap();
+        let token_id = collection.minted + 1;
+        collection.minted = token_id;
+        self.collections.insert(collection_id, collection);
+        
+        let token = Token {
+            metadata_uri: uri.clone(),
+            minted_at: block.timestamp,
+        };
+        self.tokens.insert((collection_id, token_id), token);
+        self.owners.insert((collection_id, token_id), msg.sender);
+        
+        let current_balance = self.balances.get((collection_id, msg.sender)).unwrap_or(0);
+        self.balances.insert((collection_id, msg.sender), current_balance + 1);
+        
+        emit TokenMinted {
+            collection_id,
+            token_id,
+            owner: msg.sender,
+            metadata_uri: uri,
+        };
+    }
+}
+
+#[gas_limit(15000)]
+fn batch_buy(orders: Vec<(u64, u32)>) {
+    verify_not_paused();
+    verify orders.len() <= self.BATCH_BUY_MAX as usize, "BATCH_TOO_LARGE";
+    
+    let payment_token = Address::from(self); // placeholder
+    let mut total_price: u128 = 0;
+    
+    // First pass: validate and sum prices
+    for i in 0..orders.len() {
+        if i >= self.BATCH_BUY_MAX as usize {
+            break;
+        }
+        let (collection_id, token_id) = orders[i];
+        let listing = self.listings.get((collection_id, token_id)).unwrap();
+        verify listing.seller != msg.sender, "CANNOT_BUY_OWN";
+        total_price += listing.price;
+    }
+    
+    // Transfer total payment
+    Token::transfer_from(payment_token, msg.sender, Address::from(self), total_price);
+    
+    // Second pass: execute purchases
+    for i in 0..orders.len() {
+        if i >= self.BATCH_BUY_MAX as usize {
+            break;
+        }
+        let (collection_id, token_id) = orders[i];
+        let listing = self.listings.get((collection_id, token_id)).unwrap();
+        let price = listing.price;
+        let seller = listing.seller;
+        
+        let royalty_config = self.royalties.get(collection_id).unwrap_or(RoyaltyConfig {
+            recipient: Address::zero(),
+            bps: 0,
+        });
+        let royalty = price * royalty_config.bps as u128 / 10000;
+        let proceeds = price - royalty;
+        
+        if proceeds > 0 {
+            Token::transfer(payment_token, seller, proceeds);
+        }
+        if royalty > 0 && royalty_config.recipient != Address::zero() {
+            Token::transfer(payment_token, royalty_config.recipient, royalty);
+        }
+        
+        // Transfer ownership
+        self.owners.insert((collection_id, token_id), msg.sender);
+        
+        let seller_balance = self.balances.get((collection_id, seller)).unwrap_or(0);
+        self.balances.insert((collection_id, seller), seller_balance - 1);
+        
+        let buyer_balance = self.balances.get((collection_id, msg.sender)).unwrap_or(0);
+        self.balances.insert((collection_id, msg.sender), buyer_balance + 1);
+        
+        self.listings.remove((collection_id, token_id));
+        
+        emit TokenSold {
+            collection_id,
+            token_id,
+            seller,
+            buyer: msg.sender,
+            price,
+            royalty,
+        };
+    }
+}
+
+// --- Admin Functions ---
+
+#[gas_limit(3000)]
+fn set_paused(paused: bool) {
+    verify_only_admin();
+    self.paused = paused;
+}
+
+#[gas_limit(3000)]
+fn set_mint_active(collection_id: u64, active: bool) {
+    verify_only_admin();
+    let mut collection = self.collections.get(collection_id).unwrap();
+    collection.is_mint_active = active;
+    self.collections.insert(collection_id, collection);
+}
+
+#[gas_limit(3000)]
+fn update_royalty(collection_id: u64, recipient: Address, bps: u16) {
+    verify_only_admin();
+    verify bps <= self.MAX_ROYALTY_BPS, "ROYALTY_TOO_HIGH";
+    
+    let royalty = RoyaltyConfig { recipient, bps };
+    self.royalties.insert(collection_id, royalty);
+}
+
+// --- View Functions ---
+
+fn get_collection_info(collection_id: u64) -> CollectionInfo {
+    let collection = self.collections.get(collection_id).unwrap();
+    let royalty = self.royalties.get(collection_id).unwrap_or(RoyaltyConfig {
+        recipient: Address::zero(),
+        bps: 0,
+    });
+    
+    CollectionInfo {
+        collection_id,
+        creator: collection.creator,
+        name: collection.name.clone(),
+        symbol: collection.symbol.clone(),
+        max_supply: collection.max_supply,
+        minted: collection.minted,
+        mint_price: collection.mint_price,
+        is_mint_active: collection.is_mint_active,
+        royalty_bps: royalty.bps,
+    }
+}
+
+fn get_owner(collection_id: u64, token_id: u32) -> Address {
+    self.owners.get((collection_id, token_id)).unwrap_or(Address::zero())
+}
+
+fn get_balance(collection_id: u64, user: Address) -> u32 {
+    self.balances.get((collection_id, user)).unwrap_or(0)
+}
+
+fn get_listing(collection_id: u64, token_id: u32) -> Listing {
+    self.listings.get((collection_id, token_id)).unwrap_or(Listing {
+        seller: Address::zero(),
+        price: 0,
+        created_at: 0,
+    })
+}
+
+fn token_exists(collection_id: u64, token_id: u32) -> bool {
+    self.tokens.contains((collection_id, token_id))
+}
+
+fn get_token_uri(collection_id: u64, token_id: u32) -> String {
+    let token = self.tokens.get((collection_id, token_id)).unwrap();
+    token.metadata_uri.clone()
+}

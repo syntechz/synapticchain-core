@@ -1,0 +1,457 @@
+// SynapticChain AMM DEX — Constant Product AMM with Fee Tiers
+// Version: 1.0 | Compile-target: SynapticLang v2
+
+#[state]
+struct AMM_DEX {
+    // --- Core storage ---
+    pools: Map<(Address, Address), Pool>,
+    lp_balances: Map<(u64, Address), u128>,
+    total_supply: Map<u64, u128>,
+    next_pool_id: u64,
+    fee_recipient: Address,
+    paused: bool,
+
+    // --- Constants (compile-time) ---
+    const MINIMUM_LIQUIDITY: u128 = 1000,
+    const MAX_POOLS: u64 = 10000,
+}
+
+// --- Data Structures ---
+
+struct Pool {
+    token0: Address,
+    token1: Address,
+    reserve0: u128,
+    reserve1: u128,
+    fee_bps: u16,
+    k_last: u128,
+}
+
+struct PoolInfo {
+    pool_id: u64,
+    token0: Address,
+    token1: Address,
+    reserve0: u128,
+    reserve1: u128,
+    fee_bps: u16,
+    total_supply: u128,
+}
+
+// --- Events ---
+
+event PoolCreated {
+    pool_id: u64,
+    token0: Address,
+    token1: Address,
+    fee_bps: u16,
+}
+
+event LiquidityAdded {
+    pool_id: u64,
+    sender: Address,
+    amount0: u128,
+    amount1: u128,
+    shares: u128,
+}
+
+event LiquidityRemoved {
+    pool_id: u64,
+    sender: Address,
+    amount0: u128,
+    amount1: u128,
+    shares: u128,
+}
+
+event Swap {
+    pool_id: u64,
+    sender: Address,
+    token_in: Address,
+    token_out: Address,
+    amount_in: u128,
+    amount_out: u128,
+    fee: u128,
+}
+
+event Sync {
+    pool_id: u64,
+    reserve0: u128,
+    reserve1: u128,
+}
+
+// --- Math Helpers ---
+
+fn quote(amount_a: u128, reserve_a: u128, reserve_b: u128) -> u128 {
+    verify reserve_a > 0 && reserve_b > 0, "INSUFFICIENT_RESERVES";
+    let amount_b = amount_a * reserve_b / reserve_a;
+    amount_b
+}
+
+fn get_amount_out(amount_in: u128, reserve_in: u128, reserve_out: u128, fee_bps: u16) -> u128 {
+    verify amount_in > 0, "INSUFFICIENT_INPUT";
+    verify reserve_in > 0 && reserve_out > 0, "INSUFFICIENT_RESERVES";
+    let amount_in_with_fee = amount_in * (10000 - fee_bps as u128);
+    let numerator = amount_in_with_fee * reserve_out;
+    let denominator = reserve_in * 10000 + amount_in_with_fee;
+    let amount_out = numerator / denominator;
+    amount_out
+}
+
+fn get_amount_in(amount_out: u128, reserve_in: u128, reserve_out: u128, fee_bps: u16) -> u128 {
+    verify amount_out > 0, "INSUFFICIENT_OUTPUT";
+    verify reserve_in > 0 && reserve_out > 0, "INSUFFICIENT_RESERVES";
+    let numerator = reserve_in * amount_out * 10000;
+    let denominator = (reserve_out - amount_out) * (10000 - fee_bps as u128);
+    let amount_in = numerator / denominator + 1;
+    amount_in
+}
+
+fn sort_tokens(token_a: Address, token_b: Address) -> (Address, Address) {
+    verify token_a != token_b, "IDENTICAL_ADDRESSES";
+    verify token_a != Address::zero() && token_b != Address::zero(), "ZERO_ADDRESS";
+    if token_a < token_b {
+        (token_a, token_b)
+    } else {
+        (token_b, token_a)
+    }
+}
+
+// --- Access Control ---
+
+fn verify_not_paused() {
+    verify !self.paused, "PAUSED";
+}
+
+fn verify_only_admin() {
+    verify msg.sender == self.fee_recipient, "UNAUTHORIZED";
+}
+
+// --- Entry Functions ---
+
+#[gas_limit(5000)]
+fn create_pool(token_a: Address, token_b: Address, fee_bps: u16) -> u64 {
+    verify_not_paused();
+    verify fee_bps == 5 || fee_bps == 30 || fee_bps == 100, "INVALID_FEE_TIER";
+
+    let (token0, token1) = sort_tokens(token_a, token_b);
+    verify !self.pools.contains((token0, token1)), "POOL_EXISTS";
+    verify self.next_pool_id < self.MAX_POOLS, "MAX_POOLS_REACHED";
+
+    let pool_id = self.next_pool_id;
+    self.next_pool_id = pool_id + 1;
+
+    let pool = Pool {
+        token0: token0,
+        token1: token1,
+        reserve0: 0,
+        reserve1: 0,
+        fee_bps: fee_bps,
+        k_last: 0,
+    };
+    self.pools.insert((token0, token1), pool);
+
+    emit PoolCreated { pool_id, token0, token1, fee_bps };
+    pool_id
+}
+
+#[gas_limit(8000)]
+fn add_liquidity(
+    pool_id: u64,
+    amount0_desired: u128,
+    amount1_desired: u128,
+    amount0_min: u128,
+    amount1_min: u128,
+    to: Address,
+) -> (u128, u128, u128) {
+    verify_not_paused();
+    verify pool_id < self.next_pool_id, "INVALID_POOL";
+
+    let key = self.get_pool_key_by_id(pool_id);
+    let pool = self.pools.get(key).unwrap();
+    let (token0, token1) = (pool.token0, pool.token1);
+
+    let (amount0, amount1, shares): (u128, u128, u128);
+
+    if pool.reserve0 == 0 && pool.reserve1 == 0 {
+        // First liquidity
+        amount0 = amount0_desired;
+        amount1 = amount1_desired;
+        let prod = amount0 * amount1;
+        shares = prod.sqrt() - self.MINIMUM_LIQUIDITY;
+    } else {
+        let amount0_optimal = quote(amount1_desired, pool.reserve1, pool.reserve0);
+        let amount1_optimal = quote(amount0_desired, pool.reserve0, pool.reserve1);
+
+        if amount0_optimal <= amount0_desired {
+            verify amount0_optimal >= amount0_min, "INSUFFICIENT_A_AMOUNT";
+            amount0 = amount0_optimal;
+            amount1 = amount1_desired;
+        } else {
+            verify amount1_optimal >= amount1_min, "INSUFFICIENT_B_AMOUNT";
+            amount0 = amount0_desired;
+            amount1 = amount1_optimal;
+        }
+
+        let total = self.total_supply.get(pool_id).unwrap_or(0);
+        shares = (amount0 * total / pool.reserve0).min(amount1 * total / pool.reserve1);
+    }
+
+    verify shares > 0, "INSUFFICIENT_SHARES";
+
+    // Transfer tokens from sender to pool
+    Token::transfer_from(token0, msg.sender, Address::from(self), amount0);
+    Token::transfer_from(token1, msg.sender, Address::from(self), amount1);
+
+    // Update reserves
+    let mut pool = self.pools.get_mut(key).unwrap();
+    pool.reserve0 += amount0;
+    pool.reserve1 += amount1;
+    pool.k_last = pool.reserve0 * pool.reserve1;
+
+    // Mint shares
+    let current_balance = self.lp_balances.get((pool_id, to)).unwrap_or(0);
+    self.lp_balances.insert((pool_id, to), current_balance + shares);
+    let current_supply = self.total_supply.get(pool_id).unwrap_or(0);
+    self.total_supply.insert(pool_id, current_supply + shares);
+
+    emit LiquidityAdded { pool_id, sender: msg.sender, amount0, amount1, shares };
+    emit Sync { pool_id, reserve0: pool.reserve0, reserve1: pool.reserve1 };
+    (amount0, amount1, shares)
+}
+
+#[gas_limit(8000)]
+fn remove_liquidity(
+    pool_id: u64,
+    shares: u128,
+    amount0_min: u128,
+    amount1_min: u128,
+    to: Address,
+) -> (u128, u128) {
+    verify_not_paused();
+    verify pool_id < self.next_pool_id, "INVALID_POOL";
+
+    let key = self.get_pool_key_by_id(pool_id);
+    let pool = self.pools.get(key).unwrap();
+    let total_supply = self.total_supply.get(pool_id).unwrap_or(0);
+
+    verify total_supply > 0, "NO_LIQUIDITY";
+
+    let amount0 = shares * pool.reserve0 / total_supply;
+    let amount1 = shares * pool.reserve1 / total_supply;
+
+    verify amount0 >= amount0_min && amount1 >= amount1_min, "INSUFFICIENT_OUTPUT";
+
+    // Burn shares
+    let sender_balance = self.lp_balances.get((pool_id, msg.sender)).unwrap_or(0);
+    verify sender_balance >= shares, "INSUFFICIENT_SHARES";
+    self.lp_balances.insert((pool_id, msg.sender), sender_balance - shares);
+    self.total_supply.insert(pool_id, total_supply - shares);
+
+    // Update reserves
+    let mut pool = self.pools.get_mut(key).unwrap();
+    pool.reserve0 -= amount0;
+    pool.reserve1 -= amount1;
+    pool.k_last = pool.reserve0 * pool.reserve1;
+
+    // Transfer tokens to recipient
+    Token::transfer(pool.token0, to, amount0);
+    Token::transfer(pool.token1, to, amount1);
+
+    emit LiquidityRemoved { pool_id, sender: msg.sender, amount0, amount1, shares };
+    emit Sync { pool_id, reserve0: pool.reserve0, reserve1: pool.reserve1 };
+    (amount0, amount1)
+}
+
+#[gas_limit(6000)]
+fn swap_exact_in(
+    pool_id: u64,
+    amount_in: u128,
+    token_in: Address,
+    min_out: u128,
+    to: Address,
+) -> u128 {
+    verify_not_paused();
+    verify pool_id < self.next_pool_id, "INVALID_POOL";
+
+    let key = self.get_pool_key_by_id(pool_id);
+    let pool = self.pools.get(key).unwrap();
+
+    let (reserve_in, reserve_out, token_out): (u128, u128, Address);
+    if token_in == pool.token0 {
+        reserve_in = pool.reserve0;
+        reserve_out = pool.reserve1;
+        token_out = pool.token1;
+    } else if token_in == pool.token1 {
+        reserve_in = pool.reserve1;
+        reserve_out = pool.reserve0;
+        token_out = pool.token0;
+    } else {
+        verify false, "INVALID_TOKEN";
+        return 0;
+    }
+
+    let amount_out = get_amount_out(amount_in, reserve_in, reserve_out, pool.fee_bps);
+    verify amount_out >= min_out, "INSUFFICIENT_OUTPUT";
+
+    // Transfer token_in from sender to pool
+    Token::transfer_from(token_in, msg.sender, Address::from(self), amount_in);
+
+    // Transfer token_out from pool to recipient
+    Token::transfer(token_out, to, amount_out);
+
+    // Update reserves
+    let mut pool = self.pools.get_mut(key).unwrap();
+    if token_in == pool.token0 {
+        pool.reserve0 += amount_in;
+        pool.reserve1 -= amount_out;
+    } else {
+        pool.reserve1 += amount_in;
+        pool.reserve0 -= amount_out;
+    }
+    pool.k_last = pool.reserve0 * pool.reserve1;
+
+    let fee = amount_in * pool.fee_bps as u128 / 10000;
+
+    emit Swap {
+        pool_id,
+        sender: msg.sender,
+        token_in,
+        token_out,
+        amount_in,
+        amount_out,
+        fee,
+    };
+    emit Sync { pool_id, reserve0: pool.reserve0, reserve1: pool.reserve1 };
+    amount_out
+}
+
+#[gas_limit(6000)]
+fn swap_exact_out(
+    pool_id: u64,
+    amount_out: u128,
+    token_out: Address,
+    max_in: u128,
+    to: Address,
+) -> u128 {
+    verify_not_paused();
+    verify pool_id < self.next_pool_id, "INVALID_POOL";
+
+    let key = self.get_pool_key_by_id(pool_id);
+    let pool = self.pools.get(key).unwrap();
+
+    let (reserve_in, reserve_out, token_in): (u128, u128, Address);
+    if token_out == pool.token0 {
+        reserve_in = pool.reserve1;
+        reserve_out = pool.reserve0;
+        token_in = pool.token1;
+    } else if token_out == pool.token1 {
+        reserve_in = pool.reserve0;
+        reserve_out = pool.reserve1;
+        token_in = pool.token0;
+    } else {
+        verify false, "INVALID_TOKEN";
+        return 0;
+    }
+
+    let amount_in = get_amount_in(amount_out, reserve_in, reserve_out, pool.fee_bps);
+    verify amount_in <= max_in, "EXCESSIVE_INPUT";
+
+    // Transfer token_in from sender to pool
+    Token::transfer_from(token_in, msg.sender, Address::from(self), amount_in);
+
+    // Transfer token_out from pool to recipient
+    Token::transfer(token_out, to, amount_out);
+
+    // Update reserves
+    let mut pool = self.pools.get_mut(key).unwrap();
+    if token_in == pool.token0 {
+        pool.reserve0 += amount_in;
+        pool.reserve1 -= amount_out;
+    } else {
+        pool.reserve1 += amount_in;
+        pool.reserve0 -= amount_out;
+    }
+    pool.k_last = pool.reserve0 * pool.reserve1;
+
+    let fee = amount_in * pool.fee_bps as u128 / 10000;
+
+    emit Swap {
+        pool_id,
+        sender: msg.sender,
+        token_in,
+        token_out,
+        amount_in,
+        amount_out,
+        fee,
+    };
+    emit Sync { pool_id, reserve0: pool.reserve0, reserve1: pool.reserve1 };
+    amount_in
+}
+
+#[gas_limit(3000)]
+fn sync(pool_id: u64) {
+    verify pool_id < self.next_pool_id, "INVALID_POOL";
+    let key = self.get_pool_key_by_id(pool_id);
+    let mut pool = self.pools.get_mut(key).unwrap();
+
+    // Read actual token balances and sync reserves
+    let balance0 = Token::balance_of(pool.token0, Address::from(self));
+    let balance1 = Token::balance_of(pool.token1, Address::from(self));
+    pool.reserve0 = balance0;
+    pool.reserve1 = balance1;
+    pool.k_last = pool.reserve0 * pool.reserve1;
+
+    emit Sync { pool_id, reserve0: pool.reserve0, reserve1: pool.reserve1 };
+}
+
+// --- Admin Functions ---
+
+#[gas_limit(3000)]
+fn set_fee_recipient(new_recipient: Address) {
+    verify_only_admin();
+    self.fee_recipient = new_recipient;
+}
+
+#[gas_limit(3000)]
+fn set_paused(paused: bool) {
+    verify_only_admin();
+    self.paused = paused;
+}
+
+// --- View Functions ---
+
+fn get_pool_key_by_id(pool_id: u64) -> (Address, Address) {
+    // In a real implementation, maintain a reverse map: pool_id -> (token0, token1)
+    // For this spec, we iterate pools to find matching id (bounded by MAX_POOLS)
+    // Note: This is O(n) — replace with reverse map for production
+    let mut found = (Address::zero(), Address::zero());
+    for (key, pool) in self.pools.iter() {
+        // This would need a proper pool_id field in Pool struct
+        // Simplified: assume a separate id_to_key map in production
+    }
+    found
+}
+
+fn get_pool_info(pool_id: u64) -> PoolInfo {
+    let key = self.get_pool_key_by_id(pool_id);
+    let pool = self.pools.get(key).unwrap();
+    let total = self.total_supply.get(pool_id).unwrap_or(0);
+    PoolInfo {
+        pool_id,
+        token0: pool.token0,
+        token1: pool.token1,
+        reserve0: pool.reserve0,
+        reserve1: pool.reserve1,
+        fee_bps: pool.fee_bps,
+        total_supply: total,
+    }
+}
+
+fn get_lp_balance(pool_id: u64, user: Address) -> u128 {
+    self.lp_balances.get((pool_id, user)).unwrap_or(0)
+}
+
+fn get_reserves(pool_id: u64) -> (u128, u128) {
+    let key = self.get_pool_key_by_id(pool_id);
+    let pool = self.pools.get(key).unwrap();
+    (pool.reserve0, pool.reserve1)
+}
