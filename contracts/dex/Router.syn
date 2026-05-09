@@ -1,0 +1,187 @@
+// SynapticChain DEX - Router Contract
+// Multi-hop routing and swap helpers
+
+#[state]
+contract Router {
+    #[persistent]
+    let factory: Address;
+    #[persistent]
+    let weth: Address;  // Wrapped SYN for native token swaps
+
+    // Events
+    event SwapExactTokensForTokens {
+        amount_in: u256,
+        amount_out: u256,
+        path: Vec<Address>,
+        to: Address,
+    }
+
+    #[init]
+    fn new(factory_addr: Address, weth_addr: Address) {
+        self.factory = factory_addr;
+        self.weth = weth_addr;
+    }
+
+    // Swap exact input amount for minimum output
+    #[payable]
+    fn swap_exact_tokens_for_tokens(
+        amount_in: u256,
+        amount_out_min: u256,
+        path: Vec<Address>,
+        to: Address,
+        deadline: u64
+    ) -> Vec<u256> {
+        verify block::timestamp() <= deadline, "EXPIRED";
+        verify path.len() >= 2, "INVALID_PATH";
+        verify to != Address::zero(), "INVALID_TO";
+
+        // Calculate expected output at each hop
+        let amounts = self.get_amounts_out(amount_in, path);
+        let last_idx = amounts.len() - 1;
+        verify amounts[last_idx] >= amount_out_min, "INSUFFICIENT_OUTPUT";
+
+        // Transfer input to first pool
+        let first_pool = Factory::get_pool(self.factory, path[0], path[1]).unwrap();
+        Token::transfer_from(path[0], msg.sender, first_pool, amounts[0]);
+
+        // Execute swaps along path
+        self.swap_along_path(amounts, path, to);
+
+        emit SwapExactTokensForTokens {
+            amount_in,
+            amount_out: amounts[last_idx],
+            path,
+            to,
+        };
+
+        return amounts;
+    }
+
+    // Swap maximum input for exact output
+    #[payable]
+    fn swap_tokens_for_exact_tokens(
+        amount_out: u256,
+        amount_in_max: u256,
+        path: Vec<Address>,
+        to: Address,
+        deadline: u64
+    ) -> Vec<u256> {
+        verify block::timestamp() <= deadline, "EXPIRED";
+        verify path.len() >= 2, "INVALID_PATH";
+
+        // Calculate required input at each hop (reverse)
+        let amounts = self.get_amounts_in(amount_out, path);
+        verify amounts[0] <= amount_in_max, "EXCESSIVE_INPUT";
+
+        // Transfer input to first pool
+        let first_pool = Factory::get_pool(self.factory, path[0], path[1]).unwrap();
+        Token::transfer_from(path[0], msg.sender, first_pool, amounts[0]);
+
+        // Execute swaps
+        self.swap_along_path(amounts, path, to);
+
+        // Refund excess if any
+        if amounts[0] < amount_in_max {
+            Token::transfer(path[0], msg.sender, amount_in_max - amounts[0]);
+        }
+
+        return amounts;
+    }
+
+    // Internal: execute swaps along path
+    fn swap_along_path(amounts: Vec<u256>, path: Vec<Address>, to: Address) {
+        let path_len = path.len();
+        let mut i = 0;
+        while i < path_len - 1 {
+            let pool = Factory::get_pool(self.factory, path[i], path[i + 1]).unwrap();
+            let next_to = if i < path_len - 2 {
+                Factory::get_pool(self.factory, path[i + 1], path[i + 2]).unwrap()
+            } else {
+                to
+            };
+
+            // Determine which token is output
+            let (amount0_out, amount1_out) = if path[i] < path[i + 1] {
+                (0, amounts[i + 1])
+            } else {
+                (amounts[i + 1], 0)
+            };
+
+            Pool::swap(pool, amount0_out, amount1_out, next_to);
+            i += 1;
+        }
+    }
+
+    // Calculate output amounts for each hop
+    fn get_amounts_out(amount_in: u256, path: Vec<Address>) -> Vec<u256> {
+        verify path.len() >= 2, "INVALID_PATH";
+
+        let mut amounts = Vec::new();
+        amounts.push(amount_in);
+
+        let path_len = path.len();
+        let mut i = 0;
+        while i < path_len - 1 {
+            let pool = Factory::get_pool(self.factory, path[i], path[i + 1]).unwrap();
+            let (reserve_in, reserve_out) = if path[i] < path[i + 1] {
+                let (r0, r1, _) = Pool::get_reserves(pool);
+                (r0, r1)
+            } else {
+                let (r0, r1, _) = Pool::get_reserves(pool);
+                (r1, r0)
+            };
+
+            let out = Pool::get_amount_out(pool, amounts[amounts.len() - 1], reserve_in, reserve_out);
+            amounts.push(out);
+            i += 1;
+        }
+
+        return amounts;
+    }
+
+    // Calculate required input amounts (reverse)
+    fn get_amounts_in(amount_out: u256, path: Vec<Address>) -> Vec<u256> {
+        verify path.len() >= 2, "INVALID_PATH";
+
+        let path_len = path.len();
+        let mut amounts = Vec::new();
+        let mut j = 0;
+        while j < path_len {
+            amounts.push(0);
+            j += 1;
+        }
+        amounts[path_len - 1] = amount_out;
+
+        let mut i = path_len - 1;
+        while i > 0 {
+            let pool = Factory::get_pool(self.factory, path[i - 1], path[i]).unwrap();
+            let (reserve_out, reserve_in) = if path[i - 1] < path[i] {
+                let (r0, r1, _) = Pool::get_reserves(pool);
+                (r1, r0)
+            } else {
+                let (r0, r1, _) = Pool::get_reserves(pool);
+                (r0, r1)
+            };
+
+            let fee = Pool::get_fee(pool);
+            let numerator = reserve_in * amounts[i] * 1000;
+            let denominator = (reserve_out - amounts[i]) * (1000 - fee);
+            amounts[i - 1] = numerator / denominator + 1;  // Round up
+            i -= 1;
+        }
+
+        return amounts;
+    }
+
+    // Get pair quote
+    fn quote(amount_a: u256, reserve_a: u256, reserve_b: u256) -> u256 {
+        verify amount_a > 0, "INSUFFICIENT_AMOUNT";
+        verify reserve_a > 0 && reserve_b > 0, "INSUFFICIENT_LIQUIDITY";
+        return (amount_a * reserve_b) / reserve_a;
+    }
+
+    // Get pair for tokens
+    fn pair_for(token_a: Address, token_b: Address) -> Address {
+        return Factory::get_pool(self.factory, token_a, token_b).unwrap_or(Address::zero());
+    }
+}

@@ -1,0 +1,151 @@
+// SynapticChain DEX - PriceOracle Contract
+// TWAP (Time-Weighted Average Price) oracle
+
+#[state]
+contract PriceOracle {
+    #[persistent]
+    let factory: Address;
+
+    struct Observation {
+        timestamp: u64,
+        price0_cumulative: u256,
+        price1_cumulative: u256,
+    }
+
+    // Store last observation per pool
+    #[persistent]
+    map observations: Map<Address, Observation>;
+
+    // Events
+    event PriceUpdated {
+        pool: Address,
+        price0: u256,
+        price1: u256,
+        timestamp: u64,
+    }
+
+    #[init]
+    fn new(factory_addr: Address) {
+        self.factory = factory_addr;
+    }
+
+    // Update price observation for a pool
+    fn update(pool: Address) {
+        let (reserve0, reserve1, block_timestamp_last) = Pool::get_reserves(pool);
+        let now = block::timestamp();
+
+        let last = self.observations.get(pool);
+        let mut obs = if last.is_some() {
+            let last_obs = last.unwrap();
+            let time_elapsed = now - last_obs.timestamp;
+
+            if time_elapsed > 0 && reserve0 > 0 && reserve1 > 0 {
+                Observation {
+                    timestamp: now,
+                    price0_cumulative: last_obs.price0_cumulative + ((reserve1 * u256::from(time_elapsed)) / reserve0),
+                    price1_cumulative: last_obs.price1_cumulative + ((reserve0 * u256::from(time_elapsed)) / reserve1),
+                }
+            } else {
+                last_obs
+            }
+        } else {
+            Observation {
+                timestamp: now,
+                price0_cumulative: 0,
+                price1_cumulative: 0,
+            }
+        };
+
+        self.observations.insert(pool, obs);
+
+        emit PriceUpdated {
+            pool,
+            price0: obs.price0_cumulative,
+            price1: obs.price1_cumulative,
+            timestamp: now,
+        };
+    }
+
+    // Get TWAP price over a period
+    fn consult(pool: Address, token_in: Address, amount_in: u256, seconds: u64) -> u256 {
+        verify seconds > 0, "ZERO_SECONDS";
+
+        let (reserve0, reserve1, _) = Pool::get_reserves(pool);
+        let token0 = Pool::get_token0(pool);
+        let token1 = Pool::get_token1(pool);
+
+        let now = block::timestamp();
+        let current_obs = self.observations.get(pool);
+
+        if current_obs.is_none() {
+            // No observation yet, return spot price
+            return self.quote(amount_in, reserve0, reserve1, token_in == token1);
+        }
+
+        let obs = current_obs.unwrap();
+        let time_elapsed = now - obs.timestamp;
+
+        if time_elapsed > seconds {
+            // Enough time has passed, compute TWAP
+            let price0_avg = obs.price0_cumulative / u256::from(time_elapsed);
+            let price1_avg = obs.price1_cumulative / u256::from(time_elapsed);
+
+            if token_in == token0 {
+                return (amount_in * price0_avg) / 1_000_000_000_000_000_000;
+            } else {
+                return (amount_in * price1_avg) / 1_000_000_000_000_000_000;
+            }
+        } else {
+            // Not enough history, return spot price
+            return self.quote(amount_in, reserve0, reserve1, token_in == token1);
+        }
+    }
+
+    // Get spot price quote
+    fn quote(amount_a: u256, reserve_a: u256, reserve_b: u256, is_token1: bool) -> u256 {
+        verify amount_a > 0, "INSUFFICIENT_AMOUNT";
+        verify reserve_a > 0 && reserve_b > 0, "INSUFFICIENT_LIQUIDITY";
+        return (amount_a * reserve_b) / reserve_a;
+    }
+
+    // Get current cumulative prices
+    fn get_cumulative(pool: Address) -> (u256, u256, u64) {
+        let obs = self.observations.get(pool);
+        if obs.is_some() {
+            let o = obs.unwrap();
+            return (o.price0_cumulative, o.price1_cumulative, o.timestamp);
+        }
+        return (0, 0, 0);
+    }
+
+    // Batch update multiple pools (gas efficient)
+    fn batch_update(pools: Vec<Address>) {
+        let len = pools.len();
+        let mut i = 0;
+        while i < len {
+            self.update(pools[i]);
+            i += 1;
+        }
+    }
+
+    // Get price with manipulation check
+    fn safe_consult(pool: Address, token_in: Address, amount_in: u256, seconds: u64) -> Option<u256> {
+        let (reserve0, reserve1, _) = Pool::get_reserves(pool);
+        let spot_price = self.quote(amount_in, reserve0, reserve1, token_in == Pool::get_token1(pool));
+
+        let twap_price = self.consult(pool, token_in, amount_in, seconds);
+
+        // Revert if spot price deviates more than 10% from TWAP
+        let deviation = if twap_price > spot_price {
+            ((twap_price - spot_price) * 100) / twap_price
+        } else {
+            ((spot_price - twap_price) * 100) / twap_price
+        };
+
+        if deviation > 10 {
+            return None;  // Price manipulation detected
+        }
+
+        return Some(twap_price);
+    }
+}
