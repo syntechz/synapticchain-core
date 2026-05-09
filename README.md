@@ -5,31 +5,31 @@
 [![Gateway](https://img.shields.io/badge/Gateway-v3%20live-brightgreen?style=flat-square)](https://api.synapticchain.xyz)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](./LICENSE)
 
-> Core blockchain infrastructure for SynapticChain — contracts, compiler artifacts, deployed dApps, and the unified API gateway.
+> Core blockchain infrastructure for SynapticChain - contracts, compiler artifacts, deployed dApps, and the unified API gateway.
 
 ## What's Here
 
 | Directory | Contents |
 |---|---|
-| `contracts/dex/` | 6 DEX contracts in SynLang (.syn) — Factory, Router, Pool, OrderBook, PriceOracle, FeeCollector |
-| `contracts/dapps/` | 5 compiled dApp contracts (.plan) — AMM DEX, Lending, Perpetuals, Prediction Market, NFT Marketplace |
-| `web4-academy/` | Web4 Academy v2 — educational site with Staking + NFT sections |
-| `token-launcher/` | SynapticLaunch frontend — token deployment UI |
+| `contracts/dex/` | 6 DEX contracts in SynLang (.syn) - Factory, Router, Pool, OrderBook, PriceOracle, FeeCollector |
+| `contracts/dapps/` | 5 compiled dApp contracts (.plan) - AMM DEX, Lending, Perpetuals, Prediction Market, NFT Marketplace |
+| `web4-academy/` | Web4 Academy v2 - educational site with Staking + NFT sections |
+| `token-launcher/` | SynapticLaunch frontend - token deployment UI |
 | `chrome-extension/` | Browser extension source (Manifest V3, wallet injection, key recovery) |
 | `contracts-page/` | DEX frontend contracts page |
-| `api-gateway/` | Node.js/Express + Redis unified API gateway — round-robin proxy to 18 validators |
-| `docs-site/` | GitBook-style docs site for docs.synapticchain.xyz — 10 sections, dark theme |
+| `api-gateway/` | Node.js/Express + Redis unified API gateway - round-robin proxy to 18 validators |
+| `docs-site/` | GitBook-style docs site for docs.synapticchain.xyz - 10 sections, dark theme |
 | `flagship_domains/` | Ecosystem directory with custom domain links |
 
 ## Contract Architecture
 
 **DEX Contracts (Original):**
-- `Factory.syn` — Pool creation and registry
-- `Router.syn` — Swap routing and liquidity management
-- `Pool.syn` — AMM pool logic (constant product)
-- `OrderBook.syn` — Limit order matching engine
-- `PriceOracle.syn` — On-chain price feeds
-- `FeeCollector.syn` — Fee distribution and treasury
+- `Factory.syn` - Pool creation and registry
+- `Router.syn` - Swap routing and liquidity management
+- `Pool.syn` - AMM pool logic (constant product)
+- `OrderBook.syn` - Limit order matching engine
+- `PriceOracle.syn` - On-chain price feeds
+- `FeeCollector.syn` - Fee distribution and treasury
 
 **dApp Contracts (Compiled):**
 | Contract | Functions | State Slots | Plan Size |
@@ -54,9 +54,9 @@
 
 The unified API gateway (`api-gateway/`) provides:
 - Round-robin proxy across all 18 validator nodes (Alpha + Bravo)
-- Redis hot-read cache (blocks, validators, metrics) — TTL 2-5s
+- Redis hot-read cache (blocks, validators, metrics) - TTL 2-5s
 - Rate limiting: 300 req/min per IP
-- Health checks every 5s — dead nodes auto-removed
+- Health checks every 5s - dead nodes auto-removed
 - 7 REST endpoints: `/health`, `/rest/blocks`, `/rest/validators`, `/rest/shards`, `/rest/network/stats`, `/rest/metrics`, `/rpc`
 - Prometheus aggregation from `:3000/:9100`
 - CORS enabled for all dApp origins
@@ -78,7 +78,7 @@ GitBook-style documentation at `docs.synapticchain.xyz`:
 
 ## Compiler Note
 
-SynLang uses `contract Name { state ... }` syntax. The original architecture specs used `#[state] struct` notation — these have been translated to actual SynLang syntax and compiled successfully.
+SynLang uses `contract Name { state ... }` syntax. The original architecture specs used `#[state] struct` notation - these have been translated to actual SynLang syntax and compiled successfully.
 
 ## Ecosystem
 
@@ -95,5 +95,5 @@ SynLang uses `contract Name { state ... }` syntax. The original architecture spe
 
 ## Git
 
-Branch: `main` (protected)  
+Branch: `main` (protected)
 Review required for all PRs.

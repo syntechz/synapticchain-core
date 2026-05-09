@@ -11,20 +11,43 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    - name: Check SynLang contract syntax
+    
+    - name: Verify SynLang contracts exist
       run: |
-        echo "TODO: Add SynLang compiler here"
-        echo "For now, verifying .syn files exist and are non-empty"
-        find contracts -name "*.syn" | xargs -I{} sh -c 'echo "Checking {}" && [ -s {} ]'
-    - name: Verify plan files
+        echo "Checking .syn contract files..."
+        find contracts -name "*.syn" | xargs -I{} sh -c 'echo "✓ {}" && [ -s {} ]'
+        echo "Contract count: $(find contracts -name "*.syn" | wc -l)"
+    
+    - name: Verify compiled plan files
       run: |
-        find contracts -name "*.plan" | xargs -I{} sh -c 'echo "Checking {}" && [ -s {} ]'
+        echo "Checking .plan compiled contracts..."
+        find contracts -name "*.plan" | xargs -I{} sh -c 'echo "✓ {}" && [ -s {} ]'
+        echo "Plan count: $(find contracts -name "*.plan" | wc -l)"
+    
+    - name: Check contract metadata
+      run: |
+        if [ -f contracts/dapps/contract_metadata.json ]; then
+          cat contracts/dapps/contract_metadata.json
+        fi
 
-  deploy:
-    needs: contracts
-    if: github.ref == 'refs/heads/main'
+  gateway:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    - name: Deploy to testnet
-      run: echo "TODO: Add testnet deployment script"
+    
+    - name: Verify API gateway structure
+      run: |
+        test -f api-gateway/package.json && echo "✓ package.json"
+        test -f api-gateway/install.sh && echo "✓ install.sh"
+        test -d api-gateway/routes && echo "✓ routes/"
+        test -d api-gateway/middleware && echo "✓ middleware/"
+
+  docs-site:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Verify docs site structure
+      run: |
+        test -d docs-site && echo "✓ docs-site/"
+        test -f docs-site/package.json && echo "✓ package.json"
