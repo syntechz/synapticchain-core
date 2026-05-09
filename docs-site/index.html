@@ -1,0 +1,798 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SynapticChain Documentation</title>
+<meta name="description" content="SynapticChain developer documentation — Web4 blockchain, smart contracts, API reference, validator setup.">
+<link rel="icon" type="image/png" href="/favicon-32x32.png">
+<style>
+:root {
+  --bg: #0a0e27;
+  --bg-elevated: #121a3a;
+  --bg-sidebar: #0d1130;
+  --text: #e2e8f0;
+  --text-muted: #94a3b8;
+  --accent: #00d4ff;
+  --accent-dim: #0891b2;
+  --border: #1e293b;
+  --code-bg: #0f172a;
+  --success: #00ff88;
+  --warning: #f59e0b;
+  --error: #ef4444;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.6;
+  display: flex;
+  min-height: 100vh;
+}
+
+/* Sidebar */
+.sidebar {
+  width: 280px;
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--border);
+  position: fixed;
+  height: 100vh;
+  overflow-y: auto;
+  padding: 24px 16px;
+  z-index: 100;
+}
+.sidebar-logo {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 24px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+.sidebar-logo svg { width: 32px; height: 32px; }
+.sidebar-logo h1 {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--accent);
+  letter-spacing: -0.5px;
+}
+.sidebar-logo span {
+  display: block;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-weight: 400;
+}
+.search-box {
+  width: 100%;
+  padding: 10px 14px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 13px;
+  margin-bottom: 20px;
+}
+.search-box::placeholder { color: var(--text-muted); }
+.search-box:focus { outline: none; border-color: var(--accent); }
+
+.nav-section { margin-bottom: 20px; }
+.nav-section-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+  padding-left: 8px;
+}
+.nav-link {
+  display: block;
+  padding: 8px 12px;
+  border-radius: 6px;
+  color: var(--text-muted);
+  text-decoration: none;
+  font-size: 14px;
+  transition: all 0.15s;
+  cursor: pointer;
+}
+.nav-link:hover, .nav-link.active {
+  background: var(--bg-elevated);
+  color: var(--text);
+}
+.nav-link.active { color: var(--accent); }
+
+/* Main content */
+.main {
+  margin-left: 280px;
+  flex: 1;
+  max-width: 900px;
+  padding: 40px 48px;
+}
+h2 {
+  font-size: 28px;
+  font-weight: 700;
+  margin-bottom: 16px;
+  color: var(--text);
+  scroll-margin-top: 24px;
+}
+h3 {
+  font-size: 20px;
+  font-weight: 600;
+  margin: 32px 0 12px;
+  color: var(--accent);
+  scroll-margin-top: 24px;
+}
+h4 {
+  font-size: 16px;
+  font-weight: 600;
+  margin: 24px 0 8px;
+  color: var(--text);
+}
+p { margin-bottom: 16px; color: var(--text-muted); }
+ul, ol { margin: 0 0 16px 20px; color: var(--text-muted); }
+li { margin-bottom: 6px; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* Code */
+code {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  background: var(--code-bg);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 13px;
+  color: var(--accent);
+}
+pre {
+  background: var(--code-bg);
+  padding: 16px;
+  border-radius: 8px;
+  overflow-x: auto;
+  margin: 16px 0;
+  border: 1px solid var(--border);
+}
+pre code {
+  background: none;
+  padding: 0;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* Tables */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 16px 0;
+  font-size: 14px;
+}
+th, td {
+  padding: 10px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+th {
+  color: var(--text);
+  font-weight: 600;
+  background: var(--bg-elevated);
+}
+td { color: var(--text-muted); }
+
+/* Callouts */
+.callout {
+  padding: 16px;
+  border-radius: 8px;
+  margin: 16px 0;
+  border-left: 3px solid;
+}
+.callout-info { background: rgba(0, 212, 255, 0.05); border-color: var(--accent); }
+.callout-success { background: rgba(0, 255, 136, 0.05); border-color: var(--success); }
+.callout-warning { background: rgba(245, 158, 11, 0.05); border-color: var(--warning); }
+.callout-error { background: rgba(239, 68, 68, 0.05); border-color: var(--error); }
+
+/* Section hiding */
+.section { display: none; }
+.section.active { display: block; animation: fadeIn 0.2s; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+/* Mobile */
+@media (max-width: 768px) {
+  .sidebar { width: 100%; position: relative; height: auto; }
+  .main { margin-left: 0; padding: 20px; }
+  body { flex-direction: column; }
+}
+</style>
+</head>
+<body>
+
+<nav class="sidebar">
+  <div class="sidebar-logo">
+    <svg viewBox="0 0 32 32" fill="none"><circle cx="16" cy="16" r="14" stroke="#00d4ff" stroke-width="2"/><circle cx="16" cy="16" r="6" fill="#00d4ff"/><path d="M16 2v6M16 24v6M2 16h6M24 16h6" stroke="#00d4ff" stroke-width="1.5"/></svg>
+    <div>
+      <h1>SynapticChain</h1>
+      <span>Developer Docs</span>
+    </div>
+  </div>
+  <input type="text" class="search-box" id="searchInput" placeholder="Search documentation...">
+
+  <div class="nav-section">
+    <div class="nav-section-title">Getting Started</div>
+    <a class="nav-link active" onclick="showSection('intro')">Introduction</a>
+    <a class="nav-link" onclick="showSection('architecture')">Architecture</a>
+    <a class="nav-link" onclick="showSection('quickstart')">Quick Start</a>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-section-title">Reference</div>
+    <a class="nav-link" onclick="showSection('api')">API Reference</a>
+    <a class="nav-link" onclick="showSection('contracts')">Smart Contracts</a>
+    <a class="nav-link" onclick="showSection('synlang')">SynapticLang v2</a>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-section-title">Guides</div>
+    <a class="nav-link" onclick="showSection('wallet')">Web4 Identity</a>
+    <a class="nav-link" onclick="showSection('validator')">Validator Setup</a>
+    <a class="nav-link" onclick="showSection('tutorials')">Tutorials</a>
+    <a class="nav-link" onclick="showSection('extension')">Chrome Extension</a>
+  </div>
+
+  <div class="nav-section">
+    <div class="nav-section-title">Resources</div>
+    <a class="nav-link" onclick="showSection('glossary')">Glossary</a>
+  </div>
+</nav>
+
+<main class="main">
+
+<!-- INTRODUCTION -->
+<section id="intro" class="section active">
+<h2>Introduction</h2>
+<p>SynapticChain is a next-generation Layer-1 blockchain built for Web4 — the evolution beyond Web3. With 6 shards, 18 neurons, and sub-500ms finality, SynapticChain delivers the speed, security, and scalability that decentralized applications demand.</p>
+
+<h3>What is Web4?</h3>
+<p>Web4 represents the convergence of blockchain, AI, and embedded identity. Unlike Web3's seed-phrase wallets and gas-guzzling transactions, Web4 features:</p>
+<ul>
+  <li><strong>Embedded device keys</strong> — No seed phrases, no browser extensions required</li>
+  <li><strong>Sub-500ms finality</strong> — Near-instant transaction confirmation</li>
+  <li><strong>ISO 20022 compliance</strong> — Native financial messaging (SWIFT-compatible)</li>
+  <li><strong>S=0 parallel execution</strong> — Compiler-driven scheduling, lock-free hot paths</li>
+</ul>
+
+<h3>Network Overview</h3>
+<table>
+<tr><th>Parameter</th><th>Value</th></tr>
+<tr><td>Consensus</td><td>SCBFT (Synaptic Consensus BFT)</td></tr>
+<tr><td>Finality</td><td>&lt; 500ms</td></tr>
+<tr><td>Shards</td><td>6 (3 Alpha US + 3 Bravo UK)</td></tr>
+<tr><td>Neurons</td><td>18 (9 per server)</td></tr>
+<tr><td>Language</td><td>SynapticLang v2</td></tr>
+<tr><td>Token</td><td>SYN (testnet)</td></tr>
+<tr><td>RPC</td><td>https://rpc.synapticchain.xyz</td></tr>
+<tr><td>Chain ID</td><td>synaptic-alpha-1</td></tr>
+</table>
+
+<div class="callout callout-info">
+<strong>Alpha Testnet</strong> — All contracts and dApps documented here are deployed on the Alpha testnet. Mainnet launch is targeted for Q3 2026.
+</div>
+</section>
+
+<!-- ARCHITECTURE -->
+<section id="architecture" class="section">
+<h2>Architecture</h2>
+<p>SynapticChain uses a unique S=0 architecture where the compiler drives parallel scheduling, eliminating lock contention on hot paths.</p>
+
+<h3>Server Topology</h3>
+<table>
+<tr><th>Server</th><th>Location</th><th>Nodes</th><th>Shards</th><th>IP</th></tr>
+<tr><td>Alpha</td><td>US</td><td>9</td><td>3</td><td>79.143.177.212</td></tr>
+<tr><td>Bravo</td><td>UK</td><td>9</td><td>3</td><td>147.93.1.73</td></tr>
+<tr><td>Charlie</td><td>Explorer</td><td>—</td><td>—</td><td>203.161.56.222</td></tr>
+<tr><td>uhuru</td><td>Dev/API</td><td>—</td><td>—</td><td>Prometheus :3000/:9100</td></tr>
+</table>
+
+<h3>SCBFT Consensus</h3>
+<p>Synaptic Consensus BFT combines BLS threshold signatures with a fast commit pipeline:</p>
+<ol>
+  <li>Transactions enter mempool, sorted by gas price + arrival time</li>
+  <li>Leader proposes a block every 2 seconds</li>
+  <li>Validators sign with BLS partial signatures</li>
+  <li>Threshold aggregation produces a single BLS group signature</li>
+  <li>Block is final after 2/3+1 signatures collected (&lt;500ms)</li>
+</ol>
+
+<h3>Cross-Shard Atomicity</h3>
+<p>Atomic commits across all 6 shards use a two-phase protocol with proof-of-locking. If any shard fails to lock, the entire transaction is rolled back.</p>
+
+<h3>S=0 Parallel Execution</h3>
+<p>The compiler analyzes data dependencies and schedules non-conflicting transactions to run in parallel on separate CPU cores. Hot paths use lock-free data structures (DashMap, AtomicU64, mpsc channels).</p>
+</section>
+
+<!-- QUICK START -->
+<section id="quickstart" class="section">
+<h2>Quick Start</h2>
+
+<h3>1. Connect Your Wallet</h3>
+<pre><code>const wallet = window.SynapticWallet;
+await wallet.connect();
+const address = wallet.getAddress();
+console.log("Connected:", address); // syn1abc...</code></pre>
+
+<h3>2. Get Test Tokens</h3>
+<p>Visit the <a href="https://learn.synapticchain.xyz">Academy</a> and use the faucet, or the wallet will auto-grant 1000 SYN in demo mode.</p>
+
+<h3>3. Query a Contract</h3>
+<pre><code>const res = await fetch('https://rpc.synapticchain.xyz', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'syn_callViewFunction',
+    params: {
+      contract: 'syn195fk50708yz0hjujhcuxnmxq0r9xk5x9ndc44z',
+      function: 'get_pool_count',
+      args: []
+    }
+  })
+});
+const data = await res.json();
+console.log("Pools:", data.result);</code></pre>
+
+<h3>4. Send a Transaction</h3>
+<pre><code>const tx = {
+  contract: 'syn195fk50708yz0hjujhcuxnmxq0r9xk5x9ndc44z',
+  function: 'swap_exact_in',
+  args: ['SYN_tUSDT', 1000000, 'SYN', 0],
+  gasLimit: 6000,
+  value: 0
+};
+const txHash = await wallet.signAndSend(tx);
+console.log("Tx sent:", txHash);</code></pre>
+
+<div class="callout callout-success">
+<strong>All 5 core contracts are live on Alpha testnet.</strong> See the <a onclick="showSection('contracts')">Smart Contracts</a> section for addresses and function details.
+</div>
+</section>
+
+<!-- API REFERENCE -->
+<section id="api" class="section">
+<h2>API Reference</h2>
+
+<h3>JSON-RPC Endpoints</h3>
+<table>
+<tr><th>Endpoint</th><th>Method</th><th>Description</th></tr>
+<tr><td><code>/rpc</code></td><td>POST</td><td>General JSON-RPC proxy to validators</td></tr>
+<tr><td><code>/rest/blocks</code></td><td>GET</td><td>Latest blocks (cached 2s)</td></tr>
+<tr><td><code>/rest/validators</code></td><td>GET</td><td>Active validator set (cached 5s)</td></tr>
+<tr><td><code>/rest/shards</code></td><td>GET</td><td>Shard distribution across Alpha/Bravo</td></tr>
+<tr><td><code>/rest/network/stats</code></td><td>GET</td><td>TPS, latency, block height</td></tr>
+<tr><td><code>/rest/metrics</code></td><td>GET</td><td>Prometheus aggregated metrics</td></tr>
+<tr><td><code>/health</code></td><td>GET</td><td>Gateway health + all 18 node statuses</td></tr>
+</table>
+
+<h3>View Functions (No Gas)</h3>
+<pre><code>// syn_callViewFunction — read contract state
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "syn_callViewFunction",
+  "params": {
+    "contract": "syn195fk...",
+    "function": "get_pool_reserve0",
+    "args": ["syn1token0...", "syn1token1..."]
+  }
+}
+
+// syn_getBalance — check SYN balance
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "syn_getBalance",
+  "params": { "address": "syn1user..." }
+}
+
+// syn_getTransactionReceipt — verify a tx
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "syn_getTransactionReceipt",
+  "params": { "hash": "0xabc123..." }
+}</code></pre>
+
+<h3>Transaction Submission</h3>
+<pre><code>// syn_sendTransaction — state-changing call (requires signing)
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "syn_sendTransaction",
+  "params": {
+    "contract": "syn195fk...",
+    "function": "swap_exact_in",
+    "args": ["SYN_tUSDT", 1000000, "SYN", 0],
+    "gasLimit": 6000,
+    "value": 0,
+    "sender": "syn1user...",
+    "signature": "base64_bls_signature"
+  }
+}</code></pre>
+
+<h3>WebSocket Subscriptions</h3>
+<pre><code>// Connect to wss://api.synapticchain.xyz/ws
+// Subscribe to new blocks
+{ "jsonrpc": "2.0", "id": 1, "method": "syn_subscribe", "params": ["newBlocks"] }
+
+// Subscribe to contract events
+{ "jsonrpc": "2.0", "id": 2, "method": "syn_subscribe", "params": ["events", "syn195fk..."] }</code></pre>
+</section>
+
+<!-- SMART CONTRACTS -->
+<section id="contracts" class="section">
+<h2>Smart Contracts</h2>
+<p>Five core dApp contracts are deployed on the Alpha testnet and verified.</p>
+
+<h3>Contract Addresses</h3>
+<table>
+<tr><th>Contract</th><th>Address</th><th>Functions</th><th>Status</th></tr>
+<tr><td>AMM DEX v4</td><td><code>syn195fk50708yz0hjujhcuxnmxq0r9xk5x9ndc44z</code></td><td>24</td><td>Live</td></tr>
+<tr><td>Lending Protocol v2</td><td><code>syn1rchr8tmjs0rxk8dedeywau2www7xylu84esls0</code></td><td>36</td><td>Live</td></tr>
+<tr><td>Perpetuals v1</td><td><code>syn15n3msctncgmtmp2w7jlr7nf0ql5qhpnpha59m8</code></td><td>38</td><td>Live</td></tr>
+<tr><td>Prediction Market v1</td><td><code>syn1v9sm90jgm8c6j42ktjxgqja25vwafwzdmntv7h</code></td><td>26</td><td>Live</td></tr>
+<tr><td>NFT Marketplace v1</td><td><code>syn12x0vw0d6cn6wpumwaxd8gxw333edz9hnez3n6z</code></td><td>39</td><td>Live</td></tr>
+</table>
+
+<h3>AMM DEX</h3>
+<h4>Key Functions</h4>
+<ul>
+  <li><code>create_pool(token_a, token_b, fee_tier)</code> — Deploy new liquidity pool</li>
+  <li><code>add_liquidity(pool_id, amount_a, amount_b, min_a, min_b)</code> — Provide liquidity</li>
+  <li><code>remove_liquidity(pool_id, shares, min_a, min_b)</code> — Withdraw liquidity</li>
+  <li><code>swap_exact_in(pool_id, amount_in, token_in, min_out)</code> — Swap tokens</li>
+  <li><code>get_pool_reserve0(token_a, token_b)</code> — View reserve (verified)</li>
+</ul>
+<h4>Events</h4>
+<p><code>PoolCreated</code>, <code>LiquidityAdded</code>, <code>LiquidityRemoved</code>, <code>Swap</code>, <code>Sync</code></p>
+
+<h3>Lending Protocol</h3>
+<h4>Key Functions</h4>
+<ul>
+  <li><code>deposit(token, amount)</code> — Supply collateral, mint aTokens</li>
+  <li><code>withdraw(token, amount)</code> — Withdraw (checks health factor)</li>
+  <li><code>borrow(token, amount)</code> — Borrow against collateral</li>
+  <li><code>repay(token, amount)</code> — Repay debt</li>
+  <li><code>liquidate(user, collateral_token, debt_token, debt_to_cover)</code> — Liquidate</li>
+</ul>
+<h4>Events</h4>
+<p><code>Deposit</code>, <code>Withdraw</code>, <code>Borrow</code>, <code>Repay</code>, <code>Liquidation</code></p>
+
+<h3>Perpetuals</h3>
+<h4>Key Functions</h4>
+<ul>
+  <li><code>open_position(market_id, collateral, size, is_long)</code> — Open leveraged position</li>
+  <li><code>close_position(market_id, size_to_close)</code> — Close position</li>
+  <li><code>add_collateral(market_id, additional)</code> — Add margin</li>
+  <li><code>liquidate(trader, market_id)</code> — Liquidate if margin ratio &lt; 1%</li>
+</ul>
+
+<h3>Prediction Market</h3>
+<h4>Key Functions</h4>
+<ul>
+  <li><code>create_market(question, end_time, fee_bps, min_bet, max_bet)</code> — Launch market</li>
+  <li><code>buy_shares(market_id, outcome, amount)</code> — Buy YES/NO shares</li>
+  <li><code>sell_shares(market_id, outcome, shares)</code> — Sell shares</li>
+  <li><code>resolve_market(market_id, vrf_proof)</code> — Resolve with VRF</li>
+  <li><code>claim_payout(market_id)</code> — Claim winnings</li>
+</ul>
+
+<h3>NFT Marketplace</h3>
+<h4>Key Functions</h4>
+<ul>
+  <li><code>create_collection(name, symbol, max_supply, base_uri, mint_price, royalty_bps, recipient)</code></li>
+  <li><code>mint(collection_id, metadata_uri)</code> — Mint NFT</li>
+  <li><code>list_for_sale(collection_id, token_id, price)</code> — List NFT</li>
+  <li><code>cancel_listing(collection_id, token_id)</code> — Delist</li>
+  <li><code>buy(collection_id, token_id)</code> — Purchase (handles royalties)</li>
+  <li><code>batch_mint(collection_id, count, metadata_uris)</code> — Mint up to 20 at once</li>
+</ul>
+</section>
+
+<!-- SYNAPTICLANG -->
+<section id="synlang" class="section">
+<h2>SynapticLang v2</h2>
+<p>SynapticLang is a custom smart contract DSL with compile-time verification and native sharding support.</p>
+
+<h3>Language Features</h3>
+<table>
+<tr><th>Feature</th><th>Syntax</th><th>Purpose</th></tr>
+<tr><td>State variables</td><td><code>#[state] balance: Map&lt;Address, u128&gt;</code></td><td>Persistent on-chain storage</td></tr>
+<tr><td>Gas limit</td><td><code>#[gas_limit(6000)]</code></td><td>Declare max gas per function</td></tr>
+<tr><td>Constants</td><td><code>const FEE_BPS: u16 = 30;</code></td><td>Compile-time constants</td></tr>
+<tr><td>Verify</td><td><code>verify amount > 0;</code></td><td>Runtime assertion (reverts on fail)</td></tr>
+<tr><td>Static call</td><td><code>::other_contract.function()</code></td><td>Read-only cross-contract call</td></tr>
+<tr><td>Events</td><td><code>emit Swap { pool_id, amount_in, amount_out }</code></td><td>Log on-chain events</td></tr>
+</table>
+
+<h3>Example: Simple Token</h3>
+<pre><code>#[contract]
+module MyToken {
+  #[state] balances: Map&lt;Address, u128&gt;;
+  #[state] total_supply: u128;
+  const DECIMALS: u8 = 6;
+
+  #[gas_limit(5000)]
+  fn transfer(to: Address, amount: u128) {
+    verify amount > 0;
+    let sender = msg.sender;
+    let sender_bal = balances.get(sender).unwrap_or(0);
+    verify sender_bal >= amount;
+    balances.insert(sender, sender_bal - amount);
+    let to_bal = balances.get(to).unwrap_or(0);
+    balances.insert(to, to_bal + amount);
+    emit Transfer { from: sender, to, amount };
+  }
+}</code></pre>
+
+<h3>Compilation</h3>
+<pre><code># Compile .syn to bytecode
+synlang compile token.syn --output token.syn.bin
+
+# Deploy via RPC
+curl -X POST https://rpc.synapticchain.xyz \
+  -d '{"jsonrpc":"2.0","method":"syn_sendTransaction","params":{"type":"contract_deploy","bytecode":"BASE64...","gasLimit":50000}}'</code></pre>
+</section>
+
+<!-- WEB4 IDENTITY -->
+<section id="wallet" class="section">
+<h2>Web4 Identity</h2>
+<p>SynapticChain's Web4 identity layer eliminates seed phrases through embedded device key cryptography.</p>
+
+<h3>How It Works</h3>
+<ol>
+  <li>Device generates an ed25519 keypair on first use</li>
+  <li>Private key is encrypted with AES-GCM using a device-bound secret</li>
+  <li>Public key is encoded as a bech32m address (prefix: <code>syn1</code>)</li>
+  <li>No seed phrase, no password — biometric or PIN unlocks the key</li>
+</ol>
+
+<h3>Wallet SDK Methods</h3>
+<table>
+<tr><th>Method</th><th>Returns</th><th>Description</th></tr>
+<tr><td><code>connect()</code></td><td><code>Promise&lt;Address&gt;</code></td><td>Prompt user to connect wallet</td></tr>
+<tr><td><code>disconnect()</code></td><td><code>void</code></td><td>Clear session</td></tr>
+<tr><td><code>getAddress()</code></td><td><code>Address | null</code></td><td>Current connected address</td></tr>
+<tr><td><code>getBalance(address)</code></td><td><code>Promise&lt;u128&gt;</code></td><td>Balance in micro-SYN</td></tr>
+<tr><td><code>signAndSend(tx)</code></td><td><code>Promise&lt;Hash&gt;</code></td><td>Sign and broadcast transaction</td></tr>
+<tr><td><code>isConnected()</code></td><td><code>boolean</code></td><td>Connection status</td></tr>
+</table>
+
+<h3>Transaction Object</h3>
+<pre><code>interface SynapticTx {
+  contract: string;      // Contract address
+  function: string;        // Function name
+  args: any[];             // Ordered arguments
+  gasLimit: number;        // Max gas units
+  value?: number;           // Micro-SYN to send
+}</code></pre>
+
+<h3>Demo Mode</h3>
+<p>If the wallet RPC is unreachable, the SDK falls back to demo mode with 1000 SYN automatically granted. This lets developers test dApp integration without a live validator connection.</p>
+</section>
+
+<!-- VALIDATOR SETUP -->
+<section id="validator" class="section">
+<h2>Validator Setup</h2>
+
+<h3>Requirements</h3>
+<table>
+<tr><th>Resource</th><th>Minimum</th><th>Recommended</th></tr>
+<tr><td>CPU</td><td>4 cores</td><td>8 cores</td></tr>
+<tr><td>RAM</td><td>16 GB</td><td>32 GB</td></tr>
+<tr><td>Storage</td><td>200 GB SSD</td><td>500 GB NVMe</td></tr>
+<tr><td>Network</td><td>100 Mbps</td><td>1 Gbps</td></tr>
+<tr><td>OS</td><td>Ubuntu 22.04</td><td>Ubuntu 24.04</td></tr>
+</table>
+
+<h3>Installation</h3>
+<pre><code># 1. Download synapticchain-core
+git clone https://github.com/syntechz/synapticchain-core.git
+cd synapticchain-core
+
+# 2. Build
+make build-release
+
+# 3. Generate validator keys
+./synapticchain keygen --output /opt/synapticchain/keys
+
+# 4. Configure
+nano /opt/synapticchain/config/node.toml
+# Set: shard_id = 0..5, server = alpha|bravo, bootnodes = [...]
+
+# 5. Start
+./synapticchain run --config /opt/synapticchain/config/node.toml
+
+# 6. Stake (minimum 10,000 SYN)
+./synapticchain stake --amount 10000000000000 --validator $(cat keys/address)</code></pre>
+
+<h3>Monitoring</h3>
+<p>Each validator exposes Prometheus metrics on <code>:3000/metrics</code> and node-exporter metrics on <code>:9100/metrics</code>. The unified API gateway aggregates these for the testnet explorer dashboard.</p>
+
+<div class="callout callout-warning">
+<strong>Slashing conditions:</strong> Double-signing, prolonged downtime (&gt;10% of an epoch), or invalid block proposals result in stake slashing. Run redundant nodes in different availability zones.
+</div>
+</section>
+
+<!-- TUTORIALS -->
+<section id="tutorials" class="section">
+<h2>Tutorials</h2>
+
+<h3>Tutorial 1: Deploy Your First Contract</h3>
+<pre><code>// 1. Write contract in SynapticLang
+// 2. Compile: synlang compile mycontract.syn
+// 3. Deploy via interactive script:
+node scripts/deploy-all.js
+// 4. Select contract, confirm gas, wait for receipt
+// 5. Verify: curl -X POST /rpc -d '{"method":"syn_callViewFunction","params":{"contract":"NEW_ADDRESS","function":"get_owner"}}'</code></pre>
+
+<h3>Tutorial 2: Mint an NFT</h3>
+<pre><code>const NFT_CONTRACT = 'syn12x0vw0d6cn6wpumwaxd8gxw333edz9hnez3n6z';
+
+// 1. Create collection
+const tx1 = {
+  contract: NFT_CONTRACT,
+  function: 'create_collection',
+  args: ['My Art', 'ART', 1000, 'https://metadata.example.com/', 1000000, 250, wallet.getAddress()],
+  gasLimit: 15000
+};
+const collectionTx = await wallet.signAndSend(tx1);
+
+// 2. Mint NFT
+const tx2 = {
+  contract: NFT_CONTRACT,
+  function: 'mint',
+  args: [1, 'https://metadata.example.com/1.json'],
+  gasLimit: 8000
+};
+const mintTx = await wallet.signAndSend(tx2);
+
+// 3. List for sale
+const tx3 = {
+  contract: NFT_CONTRACT,
+  function: 'list_for_sale',
+  args: [1, 1, 5000000], // collection 1, token 1, 5 SYN
+  gasLimit: 6000
+};
+await wallet.signAndSend(tx3);</code></pre>
+
+<h3>Tutorial 3: Use the DEX</h3>
+<pre><code>const DEX = 'syn195fk50708yz0hjujhcuxnmxq0r9xk5x9ndc44z';
+
+// 1. Check pool reserves
+const reserves = await rpc.call('syn_callViewFunction', {
+  contract: DEX,
+  function: 'get_pool_reserve0',
+  args: ['SYN', 'tUSDT']
+});
+
+// 2. Estimate swap output
+const estimate = await rpc.call('syn_estimateGas', {
+  contract: DEX,
+  function: 'swap_exact_in',
+  args: ['SYN_tUSDT', 1000000, 'SYN', 0],
+  sender: wallet.getAddress()
+});
+
+// 3. Execute swap
+const tx = {
+  contract: DEX,
+  function: 'swap_exact_in',
+  args: ['SYN_tUSDT', 1000000, 'SYN', 900000],
+  gasLimit: Math.floor(estimate.gas * 1.2)
+};
+const hash = await wallet.signAndSend(tx);</code></pre>
+
+<h3>Tutorial 4: Set Up a Payment Widget</h3>
+<pre><code>// Include synaptic-wallet-sdk.js on your page
+// Add the payment widget:
+&lt;div id="synaptic-pay" data-amount="1000000" data-recipient="syn1merchant..."&gt;
+&lt;/div&gt;
+&lt;script&gt;
+SynapticPay.init('#synaptic-pay', {
+  onSuccess: (tx) => console.log('Paid:', tx.hash),
+  onError: (err) => console.error('Failed:', err)
+});
+&lt;/script&gt;</code></pre>
+</section>
+
+<!-- CHROME EXTENSION -->
+<section id="extension" class="section">
+<h2>Chrome Extension</h2>
+<p>The SynapticChain Chrome extension (Manifest V3) injects <code>window.SynapticWallet</code> into every webpage for seamless dApp integration.</p>
+
+<h3>Features</h3>
+<ul>
+  <li>Background service worker for persistent key storage</li>
+  <li>AES-GCM + PBKDF2 encrypted key storage</li>
+  <li>Bech32m <code>syn1</code> addresses</li>
+  <li>Origin-locked dApp permissions</li>
+  <li>Auto-lock after 10 minutes inactivity</li>
+  <li>Private key import/export for recovery</li>
+</ul>
+
+<h3>Installation</h3>
+<pre><code># 1. Download synaptic-extension.zip
+# 2. Unzip to a folder
+# 3. Chrome → Extensions → Developer Mode ON
+# 4. Load Unpacked → Select the unzipped folder
+# 5. Extension icon appears in toolbar
+
+# Verify injection:
+console.log(window.SynapticWallet); // Object with connect(), signAndSend(), etc.</code></pre>
+
+<h3>Permissions</h3>
+<table>
+<tr><th>Permission</th><th>Purpose</th></tr>
+<tr><td><code>storage</code></td><td>Encrypted key persistence</td></tr>
+<tr><td><code>activeTab</code></td><td>Inject inpage script into current page</td></tr>
+<tr><td><code>scripting</code></td><td>Content script injection (MV3)</td></tr>
+</table>
+
+<h3>dApp Integration</h3>
+<pre><code>// In your dApp, detect the wallet:
+if (window.SynapticWallet) {
+  const wallet = window.SynapticWallet;
+  const address = await wallet.connect();
+  // User approved — proceed with contract calls
+} else {
+  // Prompt user to install extension
+  showInstallPrompt('https://chrome.google.com/webstore/detail/...');
+}</code></pre>
+</section>
+
+<!-- GLOSSARY -->
+<section id="glossary" class="section">
+<h2>Glossary</h2>
+<table>
+<tr><th>Term</th><th>Definition</th></tr>
+<tr><td>Web4</td><td>The next evolution of the web — embedded identity, AI integration, sub-500ms blockchain finality</td></tr>
+<tr><td>Neuron</td><td>A single validator node. SynapticChain has 18 neurons (9 Alpha + 9 Bravo).</td></tr>
+<tr><td>Shard</td><td>A parallel execution partition. 6 shards total — 3 per server, cross-shard atomic commits.</td></tr>
+<tr><td>SCBFT</td><td>Synaptic Consensus BFT — our BLS threshold signature consensus with sub-500ms finality.</td></tr>
+<tr><td>Synapse</td><td>A cross-shard communication channel. 3 synapses per server for intra-shard coordination.</td></tr>
+<tr><td>SynapticLang</td><td>Custom smart contract DSL with compile-time verification and sharding primitives.</td></tr>
+<tr><td>SYN</td><td>Native token of SynapticChain. Used for gas, staking, and governance.</td></tr>
+<tr><td>Micro-SYN</td><td>Smallest unit of SYN. 1 SYN = 1,000,000 micro-SYN.</td></tr>
+<tr><td>Health Factor</td><td>Lending protocol metric. HF &lt; 1 = liquidation eligible.</td></tr>
+<tr><td>VRF</td><td>Verifiable Random Function used for prediction market resolution.</td></tr>
+<tr><td>BLS</td><td>Boneh-Lynn-Shacham signature scheme for threshold aggregation in SCBFT.</td></tr>
+</table>
+</section>
+
+</main>
+
+<script>
+function showSection(id) {
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+  document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  event.target.classList.add('active');
+  window.scrollTo(0, 0);
+}
+
+// Search
+document.getElementById('searchInput').addEventListener('input', function(e) {
+  const term = e.target.value.toLowerCase();
+  document.querySelectorAll('.nav-link').forEach(link => {
+    const sectionId = link.getAttribute('onclick').match(/'(\w+)'/)[1];
+    const section = document.getElementById(sectionId);
+    const text = section.innerText.toLowerCase();
+    if (term === '' || text.includes(term)) {
+      link.style.display = 'block';
+    } else {
+      link.style.display = 'none';
+    }
+  });
+});
+</script>
+
+</body>
+</html>

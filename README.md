@@ -12,6 +12,9 @@ Core blockchain infrastructure for SynapticChain — contracts, compiler artifac
 | `token-launcher/` | SynapticLaunch frontend — token deployment UI |
 | `chrome-extension/` | Browser extension source (Manifest V3, wallet injection, key recovery) |
 | `contracts-page/` | DEX frontend contracts page |
+| `api-gateway/` | Node.js/Express + Redis unified API gateway — round-robin proxy to 18 validators |
+| `docs-site/` | GitBook-style docs site for docs.synapticchain.xyz — 10 sections, dark theme |
+| `flagship_domains/` | Ecosystem directory with custom domain links |
 
 ## Contract Architecture
 
@@ -31,6 +34,32 @@ Core blockchain infrastructure for SynapticChain — contracts, compiler artifac
 | Perpetuals v1 | 38 | 26 | 212KB |
 | Prediction Market v1 | 26 | 20 | 133KB |
 | NFT Marketplace v1 | 39 | 29 | 135KB |
+
+## API Gateway
+
+The unified API gateway (`api-gateway/`) provides:
+- Round-robin proxy across all 18 validator nodes (Alpha + Bravo)
+- Redis hot-read cache (blocks, validators, metrics) — TTL 2-5s
+- Rate limiting: 300 req/min per IP
+- Health checks every 5s — dead nodes auto-removed
+- 7 REST endpoints: /health, /rest/blocks, /rest/validators, /rest/shards, /rest/network/stats, /rest/metrics, /rpc
+- Prometheus aggregation from :3000/:9100
+- CORS enabled for all dApp origins
+
+**Deploy:**
+```bash
+cd api-gateway
+bash install.sh  # installs Redis, npm deps, starts with PM2
+curl http://localhost:8080/health  # verify
+```
+
+## Docs Site
+
+GitBook-style documentation at `docs.synapticchain.xyz`:
+- 10 sections: Intro, Architecture, Quick Start, API Reference, Smart Contracts, SynapticLang v2, Web4 Identity, Validator Setup, Tutorials, Chrome Extension, Glossary
+- Left sidebar nav, client-side search, dark Neural-Speed theme
+- All 5 contract addresses + function signatures
+- Code examples for wallet, RPC, contract deployment
 
 ## Compiler Note
 
