@@ -1,6 +1,11 @@
 # SynapticChain Core
 
-Core blockchain infrastructure for SynapticChain — contracts, compiler artifacts, and deployed applications.
+[![Blockchain](https://img.shields.io/badge/Blockchain-SynapticChain-00d4ff?style=flat-square)](https://synapticchain.xyz)
+[![Contracts](https://img.shields.io/badge/Contracts-11%20compiled-success?style=flat-square)](./contracts)
+[![Gateway](https://img.shields.io/badge/Gateway-v3%20live-brightgreen?style=flat-square)](https://api.synapticchain.xyz)
+[![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](./LICENSE)
+
+> Core blockchain infrastructure for SynapticChain — contracts, compiler artifacts, deployed dApps, and the unified API gateway.
 
 ## What's Here
 
@@ -35,6 +40,16 @@ Core blockchain infrastructure for SynapticChain — contracts, compiler artifac
 | Prediction Market v1 | 26 | 20 | 133KB |
 | NFT Marketplace v1 | 39 | 29 | 135KB |
 
+## Live Network
+
+| Endpoint | URL |
+|---|---|
+| Main Explorer | https://explorer.synapticchain.com |
+| Testnet Explorer | https://testnet-explorer.synapticchain.com |
+| API Gateway | https://api.synapticchain.xyz |
+| RPC | https://rpc.synapticchain.com |
+| Docs | https://docs.synapticchain.xyz |
+
 ## API Gateway
 
 The unified API gateway (`api-gateway/`) provides:
@@ -42,8 +57,8 @@ The unified API gateway (`api-gateway/`) provides:
 - Redis hot-read cache (blocks, validators, metrics) — TTL 2-5s
 - Rate limiting: 300 req/min per IP
 - Health checks every 5s — dead nodes auto-removed
-- 7 REST endpoints: /health, /rest/blocks, /rest/validators, /rest/shards, /rest/network/stats, /rest/metrics, /rpc
-- Prometheus aggregation from :3000/:9100
+- 7 REST endpoints: `/health`, `/rest/blocks`, `/rest/validators`, `/rest/shards`, `/rest/network/stats`, `/rest/metrics`, `/rpc`
+- Prometheus aggregation from `:3000/:9100`
 - CORS enabled for all dApp origins
 
 **Deploy:**
@@ -65,7 +80,20 @@ GitBook-style documentation at `docs.synapticchain.xyz`:
 
 SynLang uses `contract Name { state ... }` syntax. The original architecture specs used `#[state] struct` notation — these have been translated to actual SynLang syntax and compiled successfully.
 
+## Ecosystem
+
+| Property | URL | Status |
+|---|---|---|
+| synapticchain.com | https://synapticchain.com | Live |
+| synswap.xyz | https://synswap.xyz | Live |
+| synnft.xyz | https://synnft.xyz | Live |
+| synmint.xyz | https://synmint.xyz | Live |
+| synplay.xyz | https://synplay.xyz | Live |
+| syntrade.xyz | https://syntrade.xyz | Live |
+| synleaf.xyz | https://synleaf.xyz | Live |
+| synscan.xyz | https://synscan.xyz | Live |
+
 ## Git
 
-Branch: `main` (protected)
+Branch: `main` (protected)  
 Review required for all PRs.
